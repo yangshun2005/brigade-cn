@@ -1,0 +1,607 @@
+/**
+ * Channel access-control store — atomic per-channel JSON files.
+ *
+ * Two files per channel under `~/.brigade/channels/<id>/`:
+ *   - `allow-from.json` — list of approved sender ids.
+ *   - `pairing.json` — pending pairing codes (sender → code, with TTL).
+ *
+ * Both writes go via temp-file + rename for atomicity; both reads are
+ * defensive (missing/corrupt files degrade to empty + a logged warning, never
+ * crash). The pairing store auto-prunes expired + over-capacity entries on
+ * every read so callers see a consistent view.
+ */
+
+import { randomInt } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import path from "node:path";
+
+import lockfile from "proper-lockfile";
+
+import {
+	resolveChannelAllowFromPath,
+	resolveChannelGroupAllowFromPath,
+	resolveChannelOwnerPath,
+	resolveChannelPairingPath,
+	resolveChannelStateDir,
+} from "../../../config/paths.js";
+import { createSubsystemLogger } from "../../../logging/subsystem-logger.js";
+import { tryGetRuntimeContext } from "../../../storage/runtime-context.js";
+import type { PairingRequest } from "./types.js";
+
+const log = createSubsystemLogger("channels/access-control");
+
+/* ───────────────────── convex-mode dispatch plumbing ───────────────────── */
+//
+// In convex mode the per-channel JSON files never exist — state lives in the
+// channelAccess table. The policy code below (normalisation, pruning, code
+// generation, caps) is identical in both modes; only the three primitives
+// dispatch: `readJson` serves an in-process cache, `writeJsonAtomic` primes
+// the cache + enqueues a transactional row-set reconcile, and `withFileLock`
+// skips the lockfile (no file to lock; JS single-threading serialises the
+// sync read-modify-write in-process, Convex linearises across processes).
+//
+// Path→semantics registry: the path resolvers are the natural cache keys —
+// each resolved path is registered with its (channelId, accountId, kind) so
+// the write primitive knows which row set to reconcile.
+
+type AccessKindName = "allow-from" | "group-allow-from" | "pairing";
+interface AccessSem {
+	channelId: string;
+	accountId: string;
+	kind: AccessKindName;
+}
+
+const accessCache = new Map<string, unknown>();
+const pathSem = new Map<string, AccessSem>();
+let accessFlushChain: Promise<void> = Promise.resolve();
+
+function inConvexMode(): boolean {
+	return tryGetRuntimeContext()?.mode === "convex";
+}
+
+function allowFromPath(channelId: string, acct: string | null): string {
+	const p = resolveChannelAllowFromPath(channelId, acct);
+	pathSem.set(p, { channelId, accountId: acct ?? "default", kind: "allow-from" });
+	return p;
+}
+function groupAllowFromPath(channelId: string, acct: string | null): string {
+	const p = resolveChannelGroupAllowFromPath(channelId, acct);
+	pathSem.set(p, { channelId, accountId: acct ?? "default", kind: "group-allow-from" });
+	return p;
+}
+function pairingPath(channelId: string, acct: string | null): string {
+	const p = resolveChannelPairingPath(channelId, acct);
+	pathSem.set(p, { channelId, accountId: acct ?? "default", kind: "pairing" });
+	return p;
+}
+
+/** Convex-mode boot hydration — install the full access state (one
+ *  listAllAccessRows query, grouped here) into the in-process cache. */
+export function primeAccessCacheFromRows(
+	rows: Array<{
+		channelId: string;
+		accountId: string;
+		kind: AccessKindName;
+		senderId: string;
+		senderName?: string;
+		code?: string;
+		createdAt: string;
+		lastSeenAt: string;
+	}>,
+): void {
+	const grouped = new Map<string, typeof rows>();
+	for (const row of rows) {
+		const acct = row.accountId === "default" ? null : row.accountId;
+		const p =
+			row.kind === "allow-from"
+				? allowFromPath(row.channelId, acct)
+				: row.kind === "group-allow-from"
+					? groupAllowFromPath(row.channelId, acct)
+					: pairingPath(row.channelId, acct);
+		const bucket = grouped.get(p) ?? [];
+		bucket.push(row);
+		grouped.set(p, bucket);
+	}
+	for (const [p, bucket] of grouped) {
+		const sem = pathSem.get(p) as AccessSem;
+		if (sem.kind === "pairing") {
+			accessCache.set(p, {
+				version: 1,
+				requests: bucket.map((r) => ({
+					senderId: r.senderId,
+					...(r.senderName !== undefined ? { senderName: r.senderName } : {}),
+					code: r.code ?? "",
+					createdAt: r.createdAt,
+					lastSeenAt: r.lastSeenAt,
+				})),
+			});
+		} else {
+			accessCache.set(p, { version: 1, allowFrom: bucket.map((r) => r.senderId) });
+		}
+	}
+}
+
+function enqueueAccessReconcile(filePath: string, value: unknown): void {
+	const sem = pathSem.get(filePath);
+	const rctx = tryGetRuntimeContext();
+	if (!sem || !rctx) return;
+	const nowIso = new Date().toISOString();
+	const rows =
+		sem.kind === "pairing"
+			? ((value as { requests?: PairingRequest[] }).requests ?? []).map((r) => ({
+					senderId: r.senderId,
+					...(r.senderName !== undefined ? { senderName: r.senderName } : {}),
+					code: r.code,
+					createdAt: r.createdAt,
+					lastSeenAt: r.lastSeenAt,
+				}))
+			: ((value as { allowFrom?: string[] }).allowFrom ?? []).map((senderId) => ({
+					senderId,
+					createdAt: nowIso,
+					lastSeenAt: nowIso,
+				}));
+	const store = rctx.store;
+	accessFlushChain = accessFlushChain
+		.then(() =>
+			store.channels.reconcileAccessRows({
+				channelId: sem.channelId,
+				accountId: sem.accountId === "default" ? null : sem.accountId,
+				kind: sem.kind,
+				rows,
+			}),
+		)
+		.catch((err) => {
+			console.error(
+				`brigade: access-control write to convex failed (${sem.channelId}/${sem.kind}) — ${(err as Error).message}`,
+			);
+		});
+}
+
+/** Resolves when every access-control mutation enqueued so far reached the
+ *  backend (convex mode). */
+export function awaitAccessFlush(): Promise<void> {
+	return accessFlushChain;
+}
+
+/** Test-only. */
+export function __resetAccessCacheForTests(): void {
+	accessCache.clear();
+	pathSem.clear();
+	accessFlushChain = Promise.resolve();
+}
+
+// Code alphabet: deliberately drops `0/O/1/I` so an operator reading a code
+// over voice or copying from a screenshot can't fumble it. 32^8 ≈ 1.1×10¹²
+// combinations is plenty for a 1-hour, max-3-pending window.
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const CODE_LENGTH = 8;
+/** Pending codes expire after this long. */
+export const PAIRING_TTL_MS = 60 * 60 * 1000; // 1h
+/** Most pending codes per channel; LRU-evicted on overflow. */
+export const PAIRING_MAX_PENDING = 3;
+
+/* ─────────────────────────── atomic JSON ─────────────────────────── */
+
+function ensureParentDir(filePath: string): void {
+	mkdirSync(path.dirname(filePath), { recursive: true });
+}
+
+function readJson<T>(filePath: string, fallback: T): T {
+	if (inConvexMode()) {
+		const cached = accessCache.get(filePath);
+		return cached !== undefined ? (structuredClone(cached) as T) : fallback;
+	}
+	if (!existsSync(filePath)) return fallback;
+	let raw: string;
+	try {
+		raw = readFileSync(filePath, "utf8");
+	} catch {
+		return fallback;
+	}
+	// Zero-byte / whitespace-only files are a known artifact: `withFileLock`
+	// creates an empty placeholder before the first write, and an interrupted
+	// write can leave a partial file. Treat both as "absent" silently — no
+	// WARN, no recurring "unreadable" log on every turn.
+	if (raw.trim().length === 0) return fallback;
+	try {
+		return JSON.parse(raw) as T;
+	} catch (err) {
+		// Genuinely corrupted JSON: log ONCE at INFO (not WARN — this is
+		// self-healing), then overwrite with the serialized fallback so the
+		// next read returns clean data instead of repeating this branch.
+		log.info("access-control store reset to empty state (file was corrupted)", {
+			path: filePath,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		try {
+			writeJsonAtomic(filePath, fallback);
+		} catch {
+			/* best-effort heal */
+		}
+		return fallback;
+	}
+}
+
+function writeJsonAtomic(filePath: string, value: unknown): void {
+	if (inConvexMode()) {
+		accessCache.set(filePath, structuredClone(value));
+		enqueueAccessReconcile(filePath, value);
+		return;
+	}
+	ensureParentDir(filePath);
+	const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+	writeFileSync(tmp, JSON.stringify(value, null, 2));
+	renameSync(tmp, filePath);
+}
+
+/**
+ * Serialize every read-modify-write on `filePath` behind a real file lock so
+ * the gateway and CLI can't race each other into a lost update. Atomic-rename
+ * protects against torn writes; the lock protects against two processes
+ * reading the same JSON, both pruning, and both writing — only the last write
+ * would win, silently dropping the other's allow-from add. `proper-lockfile`
+ * handles stale-lock recovery + retries (sync API keeps the store callers sync
+ * so we don't propagate async through the CLI surface).
+ */
+function withFileLock<T>(filePath: string, fn: () => T): T {
+	if (inConvexMode()) {
+		// No file to lock. The callers' read-modify-write is synchronous, so
+		// JS single-threading already serialises it in-process; cross-process
+		// writes are linearised by the Convex reconcile mutation.
+		return fn();
+	}
+	ensureParentDir(filePath);
+	// proper-lockfile requires the target to exist; create an empty placeholder
+	// if needed — the real content lands when fn() calls writeJsonAtomic.
+	if (!existsSync(filePath)) writeFileSync(filePath, "");
+	// proper-lockfile's `lockSync` doesn't accept `retries` (it can't sleep). The
+	// contention windows here are microseconds (read + JSON.parse + write a tiny
+	// file), so a busy-wait retry loop with a few jittered tries is enough. Each
+	// attempt either acquires immediately or throws ELOCKED.
+	const MAX_ATTEMPTS = 12;
+	let attempt = 0;
+	let release: () => void = () => {};
+	while (attempt < MAX_ATTEMPTS) {
+		try {
+			release = lockfile.lockSync(filePath, { stale: 30_000 });
+			break;
+		} catch (err) {
+			attempt += 1;
+			if (attempt >= MAX_ATTEMPTS) throw err;
+			// Cheap synchronous spin: a few microseconds of busywork; jittered.
+			const spinUntil = Date.now() + (5 + Math.floor(Math.random() * 25));
+			while (Date.now() < spinUntil) {
+				/* spin */
+			}
+		}
+	}
+	try {
+		return fn();
+	} finally {
+		try {
+			release();
+		} catch {
+			/* best-effort release */
+		}
+	}
+}
+
+/* ─────────────────────────── allow-from list ─────────────────────────── */
+
+interface AllowFromFile {
+	version: 1;
+	allowFrom: string[];
+}
+
+/**
+ * Read the deduped, normalized allow-from list for a channel account. When
+ * `accountId` is omitted (or `"default"`), the legacy single-account file at
+ * `~/.brigade/channels/<id>/allow-from.json` is read. Multi-account installs
+ * additionally MERGE the legacy file in so an operator who approved a sender
+ * before per-account partitioning landed isn't kicked off the list.
+ */
+export function readAllowFrom(channelId: string, accountId?: string | null): string[] {
+	const acct = (accountId ?? "").trim();
+	const data = readJson<AllowFromFile>(allowFromPath(channelId, acct || null), { version: 1, allowFrom: [] });
+	const entries = (data.allowFrom ?? []).map((x) => normalizeId(x)).filter(Boolean);
+	// Multi-account legacy-merge: pull in the channel-wide legacy file too.
+	if (acct && acct !== "default") {
+		const legacy = readJson<AllowFromFile>(allowFromPath(channelId, null), { version: 1, allowFrom: [] });
+		for (const raw of legacy.allowFrom ?? []) {
+			const id = normalizeId(raw);
+			if (id) entries.push(id);
+		}
+	}
+	return [...new Set(entries)];
+}
+
+/** Add a sender to the allow-from list. Returns true if newly added. */
+export function addAllowFrom(channelId: string, senderId: string, accountId?: string | null): boolean {
+	const id = normalizeId(senderId);
+	if (!id) return false;
+	const acct = (accountId ?? "").trim();
+	const filePath = allowFromPath(channelId, acct || null);
+	return withFileLock(filePath, () => {
+		const current = readAllowFrom(channelId, acct || null);
+		if (current.includes(id)) return false;
+		writeJsonAtomic(filePath, { version: 1, allowFrom: [...current, id] } satisfies AllowFromFile);
+		return true;
+	});
+}
+
+/** Remove a sender from the allow-from list. Returns true if it was present. */
+export function removeAllowFrom(channelId: string, senderId: string, accountId?: string | null): boolean {
+	const id = normalizeId(senderId);
+	if (!id) return false;
+	const acct = (accountId ?? "").trim();
+	const filePath = allowFromPath(channelId, acct || null);
+	return withFileLock(filePath, () => {
+		const current = readAllowFrom(channelId, acct || null);
+		if (!current.includes(id)) return false;
+		writeJsonAtomic(filePath, { version: 1, allowFrom: current.filter((x) => x !== id) } satisfies AllowFromFile);
+		return true;
+	});
+}
+
+/* ─────────────────────────── channel owner ─────────────────────────── */
+
+interface OwnerFile {
+	version: 1;
+	owner?: string;
+}
+
+/**
+ * Read the recorded operator id for a channel whose bot account is separate
+ * from the operator (Telegram). Returns null when no owner has been claimed.
+ * WhatsApp never writes this — its linked-self id already identifies the owner.
+ */
+export function readChannelOwner(channelId: string, accountId?: string | null): string | null {
+	const acct = (accountId ?? "").trim();
+	const data = readJson<OwnerFile>(resolveChannelOwnerPath(channelId, acct || null), { version: 1 });
+	const id = normalizeId(data.owner ?? "");
+	return id || null;
+}
+
+/**
+ * Record the channel's operator id. First-write-wins: once an owner is set it is
+ * NOT overwritten (so a later stranger can't seize ownership). Returns true when
+ * this call established the owner, false when one already existed or the id was
+ * empty. Use `clearChannelOwner` to reset.
+ */
+export function setChannelOwner(channelId: string, senderId: string, accountId?: string | null): boolean {
+	const id = normalizeId(senderId);
+	if (!id) return false;
+	const acct = (accountId ?? "").trim();
+	const filePath = resolveChannelOwnerPath(channelId, acct || null);
+	return withFileLock(filePath, () => {
+		const existing = normalizeId(readJson<OwnerFile>(filePath, { version: 1 }).owner ?? "");
+		if (existing) return false; // first-write-wins — never seize an existing owner
+		writeJsonAtomic(filePath, { version: 1, owner: id } satisfies OwnerFile);
+		return true;
+	});
+}
+
+/** Clear the recorded owner (operator reset). Returns true if one was present. */
+export function clearChannelOwner(channelId: string, accountId?: string | null): boolean {
+	const acct = (accountId ?? "").trim();
+	const filePath = resolveChannelOwnerPath(channelId, acct || null);
+	return withFileLock(filePath, () => {
+		const existing = normalizeId(readJson<OwnerFile>(filePath, { version: 1 }).owner ?? "");
+		if (!existing) return false;
+		writeJsonAtomic(filePath, { version: 1 } satisfies OwnerFile);
+		return true;
+	});
+}
+
+/** Add `groupId` to the GROUP allow-from list. Idempotent; returns true when
+ *  the list was modified, false when the id was already present. */
+export function addGroupAllowFrom(
+	channelId: string,
+	groupId: string,
+	accountId?: string | null,
+): boolean {
+	const id = normalizeId(groupId);
+	if (!id) return false;
+	const acct = (accountId ?? "").trim();
+	const filePath = groupAllowFromPath(channelId, acct || null);
+	return withFileLock(filePath, () => {
+		const current = readGroupAllowFrom(channelId, acct || null);
+		if (current.includes(id)) return false;
+		writeJsonAtomic(filePath, {
+			version: 1,
+			allowFrom: [...current, id],
+		} satisfies AllowFromFile);
+		return true;
+	});
+}
+
+/** Remove `groupId` from the GROUP allow-from list. Returns true when the id
+ *  was present and removed. */
+export function removeGroupAllowFrom(
+	channelId: string,
+	groupId: string,
+	accountId?: string | null,
+): boolean {
+	const id = normalizeId(groupId);
+	if (!id) return false;
+	const acct = (accountId ?? "").trim();
+	const filePath = groupAllowFromPath(channelId, acct || null);
+	return withFileLock(filePath, () => {
+		const current = readGroupAllowFrom(channelId, acct || null);
+		if (!current.includes(id)) return false;
+		writeJsonAtomic(filePath, {
+			version: 1,
+			allowFrom: current.filter((x) => x !== id),
+		} satisfies AllowFromFile);
+		return true;
+	});
+}
+
+/** Read the deduped, normalized GROUP allow-from list for a channel account. */
+export function readGroupAllowFrom(channelId: string, accountId?: string | null): string[] {
+	const acct = (accountId ?? "").trim();
+	const data = readJson<AllowFromFile>(groupAllowFromPath(channelId, acct || null), { version: 1, allowFrom: [] });
+	const entries = (data.allowFrom ?? []).map((x) => normalizeId(x)).filter(Boolean);
+	if (acct && acct !== "default") {
+		const legacy = readJson<AllowFromFile>(groupAllowFromPath(channelId, null), { version: 1, allowFrom: [] });
+		for (const raw of legacy.allowFrom ?? []) {
+			const id = normalizeId(raw);
+			if (id) entries.push(id);
+		}
+	}
+	return [...new Set(entries)];
+}
+
+/** True when `senderId` is in the channel's allow-from list. */
+export function isAllowed(channelId: string, senderId: string, accountId?: string | null): boolean {
+	const id = normalizeId(senderId);
+	if (!id) return false;
+	return readAllowFrom(channelId, accountId).includes(id);
+}
+
+/* ─────────────────────────── pairing codes ─────────────────────────── */
+
+interface PairingFile {
+	version: 1;
+	requests: PairingRequest[];
+}
+
+/** Strip ASCII whitespace + uppercase; safe for both sender ids and codes. */
+function normalizeId(value: string): string {
+	return value.replace(/\s+/g, "").trim();
+}
+function normalizeCode(value: string): string {
+	return value.replace(/[\s-]+/g, "").toUpperCase();
+}
+
+/** Generate one unique 8-char code that isn't already pending in this channel. */
+function generateUniqueCode(existing: Iterable<string>): string {
+	const taken = new Set(existing);
+	for (let attempt = 0; attempt < 500; attempt++) {
+		let out = "";
+		for (let i = 0; i < CODE_LENGTH; i++) out += CODE_ALPHABET[randomInt(CODE_ALPHABET.length)];
+		if (!taken.has(out)) return out;
+	}
+	throw new Error("pairing-store: could not generate a unique code after 500 attempts");
+}
+
+/** Prune expired + over-cap entries. Returns the pruned list (oldest evicted first). */
+function pruneRequests(requests: PairingRequest[], now = Date.now()): PairingRequest[] {
+	const fresh = requests.filter((r) => now - Date.parse(r.createdAt) < PAIRING_TTL_MS);
+	if (fresh.length <= PAIRING_MAX_PENDING) return fresh;
+	// Newest by lastSeenAt wins on overflow; insertion order (later = newer)
+	// is the tie-breaker when timestamps land in the same millisecond.
+	return fresh
+		.map((r, i) => ({ r, i }))
+		.sort((a, b) => Date.parse(b.r.lastSeenAt) - Date.parse(a.r.lastSeenAt) || b.i - a.i)
+		.slice(0, PAIRING_MAX_PENDING)
+		.map((x) => x.r);
+}
+
+/** Read pending pairing requests; prunes expired/over-cap on read (under lock). */
+export function readPendingPairings(channelId: string, accountId?: string | null): PairingRequest[] {
+	const acct = (accountId ?? "").trim();
+	const filePath = pairingPath(channelId, acct || null);
+	return withFileLock(filePath, () => {
+		const data = readJson<PairingFile>(filePath, { version: 1, requests: [] });
+		const pruned = pruneRequests(data.requests ?? []);
+		// If pruning changed anything, persist so the next read is consistent.
+		if (pruned.length !== (data.requests ?? []).length) {
+			writeJsonAtomic(filePath, { version: 1, requests: pruned } satisfies PairingFile);
+		}
+		return pruned;
+	});
+}
+
+/**
+ * Issue (or re-emit) a pairing code for `senderId`. If a non-expired code is
+ * already pending for the same sender, the existing one is returned with
+ * `lastSeenAt` refreshed — the operator must approve a stable code, even if
+ * the stranger DMs repeatedly. Returns `{code, isNew}`.
+ */
+export function upsertPairingRequest(args: {
+	channelId: string;
+	senderId: string;
+	senderName?: string;
+	accountId?: string | null;
+}): { code: string; isNew: boolean } {
+	const senderId = normalizeId(args.senderId);
+	if (!senderId) throw new Error("upsertPairingRequest: senderId required");
+	const acct = (args.accountId ?? "").trim();
+	const filePath = pairingPath(args.channelId, acct || null);
+	return withFileLock(filePath, () => {
+	const data = readJson<PairingFile>(filePath, { version: 1, requests: [] });
+	const now = new Date().toISOString();
+	const fresh = pruneRequests(data.requests ?? []);
+
+	const existing = fresh.find((r) => r.senderId === senderId);
+	if (existing) {
+		existing.lastSeenAt = now;
+		if (args.senderName) existing.senderName = args.senderName;
+		writeJsonAtomic(filePath, { version: 1, requests: fresh } satisfies PairingFile);
+		return { code: existing.code, isNew: false };
+	}
+
+	const code = generateUniqueCode(fresh.map((r) => r.code));
+	const next: PairingRequest = {
+		senderId,
+		senderName: args.senderName,
+		code,
+		createdAt: now,
+		lastSeenAt: now,
+	};
+	const combined = pruneRequests([...fresh, next]);
+	writeJsonAtomic(filePath, { version: 1, requests: combined } satisfies PairingFile);
+	return { code, isNew: true };
+	});
+}
+
+/**
+ * Approve a pairing code: looks up the pending request, removes it, and adds
+ * its sender to the allow-from list. Returns the request that was approved,
+ * or `null` if the code is unknown / expired.
+ */
+export function approvePairingCode(channelId: string, code: string, accountId?: string | null): PairingRequest | null {
+	const wanted = normalizeCode(code);
+	const acct = (accountId ?? "").trim();
+	const filePath = pairingPath(channelId, acct || null);
+	const approved = withFileLock(filePath, (): PairingRequest | null => {
+		const data = readJson<PairingFile>(filePath, { version: 1, requests: [] });
+		const fresh = pruneRequests(data.requests ?? []);
+		const idx = fresh.findIndex((r) => r.code === wanted);
+		if (idx === -1) return null;
+		const a = fresh[idx] as PairingRequest;
+		fresh.splice(idx, 1);
+		writeJsonAtomic(filePath, { version: 1, requests: fresh } satisfies PairingFile);
+		return a;
+	});
+	if (approved) addAllowFrom(channelId, approved.senderId, acct || null);
+	return approved;
+}
+
+/** Drop a pending code without approving it (operator declines). Returns true if found. */
+export function revokePairingCode(channelId: string, code: string, accountId?: string | null): boolean {
+	const wanted = normalizeCode(code);
+	const acct = (accountId ?? "").trim();
+	const filePath = pairingPath(channelId, acct || null);
+	return withFileLock(filePath, () => {
+		const data = readJson<PairingFile>(filePath, { version: 1, requests: [] });
+		const fresh = pruneRequests(data.requests ?? []);
+		const idx = fresh.findIndex((r) => r.code === wanted);
+		if (idx === -1) return false;
+		fresh.splice(idx, 1);
+		writeJsonAtomic(filePath, { version: 1, requests: fresh } satisfies PairingFile);
+		return true;
+	});
+}
+
+/* ─────────────────────────── housekeeping ─────────────────────────── */
+
+/** Wipe access-control state for a channel (called by `channels unlink`). */
+export function eraseAccessState(channelId: string): void {
+	const dir = resolveChannelStateDir(channelId);
+	// allow-from + pairing files live directly under the channel state dir, so
+	// the existing `rm -rf <stateDir>` in `channels unlink` already covers them.
+	// This helper exists for tests + future per-file resets.
+	void dir;
+}

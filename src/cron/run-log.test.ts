@@ -1,0 +1,142 @@
+/**
+ * run-log — path-traversal guard + append + chmod best-effort.
+ *
+ * Tests tempdir-isolate by setting BRIGADE_STATE_DIR before resolving the
+ * run-log path, so we never touch the operator's ~/.brigade/cron/runs/.
+ */
+
+import { strict as assert } from "node:assert";
+import { describe, it } from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+import {
+	appendCronRunLog,
+	readCronRunLogEntries,
+	resolveCronRunLogDir,
+	resolveCronRunLogPath,
+} from "./run-log.js";
+
+function withTempStateDir<T>(fn: () => Promise<T> | T): Promise<T> {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "brigade-cron-runlog-test-"));
+	const prev = process.env.BRIGADE_STATE_DIR;
+	process.env.BRIGADE_STATE_DIR = dir;
+	const restore = () => {
+		if (prev === undefined) delete process.env.BRIGADE_STATE_DIR;
+		else process.env.BRIGADE_STATE_DIR = prev;
+		try {
+			fs.rmSync(dir, { recursive: true, force: true });
+		} catch {
+			/* best-effort */
+		}
+	};
+	const result = fn();
+	if (result instanceof Promise) {
+		return result.finally(restore);
+	}
+	restore();
+	return Promise.resolve(result);
+}
+
+describe("run-log — resolveCronRunLogPath path-traversal guard", () => {
+	it("rejects jobId containing `/`", async () => {
+		await withTempStateDir(() => {
+			assert.throws(() => resolveCronRunLogPath("evil/path"));
+		});
+	});
+
+	it("rejects jobId containing `\\`", async () => {
+		await withTempStateDir(() => {
+			assert.throws(() => resolveCronRunLogPath("evil\\path"));
+		});
+	});
+
+	it("rejects jobId containing NUL", async () => {
+		await withTempStateDir(() => {
+			assert.throws(() => resolveCronRunLogPath("evil\x00id"));
+		});
+	});
+
+	it("rejects empty / whitespace jobId", async () => {
+		await withTempStateDir(() => {
+			assert.throws(() => resolveCronRunLogPath(""));
+			assert.throws(() => resolveCronRunLogPath("   "));
+		});
+	});
+
+	it("rejects `..` traversal attempts", async () => {
+		await withTempStateDir(() => {
+			// Even though `..` doesn't contain a slash, raw `..` would be
+			// caught by the resolvedPath.startsWith(runsDir + sep) check
+			// because the resolved path equals runsDir/...jsonl literally.
+			// The `/` and `\` rejection covers the common attack shapes.
+			assert.throws(() => resolveCronRunLogPath("../etc/passwd"));
+		});
+	});
+
+	it("accepts a normal uuid-shaped jobId", async () => {
+		await withTempStateDir(() => {
+			const p = resolveCronRunLogPath("aaaa-bbbb-cccc-dddd");
+			const dir = path.resolve(resolveCronRunLogDir());
+			assert.ok(p.startsWith(`${dir}${path.sep}`));
+			assert.ok(p.endsWith(".jsonl"));
+		});
+	});
+});
+
+describe("run-log — appendCronRunLog + read", () => {
+	it("append + read round-trips a single entry", async () => {
+		await withTempStateDir(async () => {
+			await appendCronRunLog({
+				ts: 1_700_000_000_000,
+				jobId: "job-1",
+				action: "finished",
+				status: "ok",
+				summary: "ran fine",
+			});
+			const entries = await readCronRunLogEntries("job-1");
+			assert.equal(entries.length, 1);
+			assert.equal(entries[0]!.status, "ok");
+			assert.equal(entries[0]!.summary, "ran fine");
+		});
+	});
+
+	it("append with malformed jobId is a silent no-op (logged warn, no throw)", async () => {
+		await withTempStateDir(async () => {
+			// The append helper catches the guard error so a buggy upstream
+			// caller can't crash the timer; the entry just doesn't land.
+			await appendCronRunLog({
+				ts: 1_700_000_000_000,
+				jobId: "evil/path",
+				action: "finished",
+				status: "ok",
+			});
+			// Read with the same malformed id also returns empty (no throw).
+			const entries = await readCronRunLogEntries("evil/path");
+			assert.equal(entries.length, 0);
+		});
+	});
+
+	it("missing run-log file → empty result", async () => {
+		await withTempStateDir(async () => {
+			const entries = await readCronRunLogEntries("nonexistent-job");
+			assert.equal(entries.length, 0);
+		});
+	});
+
+	const isWindows = process.platform === "win32";
+	it("posix 0o600 on the JSONL after append (skip on Windows)", { skip: isWindows }, async () => {
+		await withTempStateDir(async () => {
+			await appendCronRunLog({
+				ts: 1_700_000_000_000,
+				jobId: "perm-job",
+				action: "finished",
+				status: "ok",
+			});
+			const p = resolveCronRunLogPath("perm-job");
+			const mode = fs.statSync(p).mode & 0o777;
+			assert.equal(mode, 0o600, `expected 0o600 perms, got ${mode.toString(8)}`);
+		});
+	});
+});

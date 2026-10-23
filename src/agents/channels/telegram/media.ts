@@ -1,0 +1,251 @@
+/**
+ * Telegram media helpers — inbound download + outbound InputFile construction.
+ *
+ * INBOUND: Telegram doesn't push file bytes; it pushes a `file_id`. To get the
+ * bytes we call `getFile(file_id)` (returns a short-lived `file_path`) then
+ * download `https://api.telegram.org/file/bot<token>/<file_path>`. Bytes are
+ * saved under `~/.brigade/channels/telegram/media/<YYYY-MM-DD>/<fileUid>.<ext>`
+ * so the agent can `read` the attachment by path. In convex mode the cache
+ * relocates to the OS cache dir (never under ~/.brigade, to respect the
+ * strict-zero guard).
+ *
+ * OUTBOUND: `buildTelegramInputFile` wraps a local path / Buffer in grammY's
+ * `InputFile`, after running it through Brigade's outbound media-path guard so
+ * a prompt-injected "send ~/.ssh/id_rsa" can't exfiltrate a secret.
+ *
+ * grammY is lazy-imported (only `InputFile` is needed, and only on the outbound
+ * path) so a non-Telegram boot never pays for the dependency.
+ */
+
+import { mkdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
+
+import { resolveChannelStateDir, resolveOsCacheDir } from "../../../config/paths.js";
+import { tryGetRuntimeContext } from "../../../storage/runtime-context.js";
+// Channel SDK barrel — the outbound-media exfil guard + the OutboundMedia type
+// All contract types come from the channel SDK barrel so the channel is built
+// entirely on `../sdk.js`.
+import {
+	validateOutboundMediaPath,
+	type InboundMediaAttachment,
+	type OutboundMedia,
+} from "../sdk.js";
+
+const CHANNEL_ID = "telegram";
+
+/**
+ * Telegram Bot API download cap is 20 MB; keep a defensive ceiling slightly
+ * under it. Anything larger is skipped (the message still reaches the agent
+ * without the attachment).
+ */
+const MAX_BYTES = 20 * 1024 * 1024;
+
+/** Public Telegram Bot API base (file downloads hang off `/file/bot<token>/…`). */
+const TELEGRAM_API_BASE = "https://api.telegram.org";
+
+/**
+ * The only host an inbound file download may ever hit. `file_path` ultimately
+ * derives from an untrusted inbound message, so before fetching we REQUIRE the
+ * built URL to resolve to https on the Telegram Bot API host — a spoofed
+ * `file_path` (e.g. `..` traversal, an `http://169.254.169.254/…` style value,
+ * or a scheme-bearing string) can't make Brigade fetch an arbitrary URL (SSRF).
+ * Mirrors the Discord/Slack inbound-media host guards.
+ */
+const TELEGRAM_FILE_HOST = "api.telegram.org";
+
+/** True only when `rawUrl` is https on the Telegram Bot API host. */
+function isAllowedTelegramFileUrl(rawUrl: string): boolean {
+	let parsed: URL;
+	try {
+		parsed = new URL(rawUrl);
+	} catch {
+		return false;
+	}
+	return parsed.protocol === "https:" && parsed.hostname.toLowerCase() === TELEGRAM_FILE_HOST;
+}
+
+/** The grammY surface the downloader needs — kept minimal + injectable for tests. */
+export interface TelegramBotFileApi {
+	/** Resolve a file_id to a downloadable `file_path` (grammY `bot.api.getFile`). */
+	getFile(fileId: string): Promise<{ file_path?: string; file_unique_id?: string; file_size?: number }>;
+}
+
+/** YYYY-MM-DD (UTC) bucket — stable filename grouping for grep / review. */
+function dayBucket(): string {
+	const d = new Date();
+	const pad = (x: number) => String(x).padStart(2, "0");
+	return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+}
+
+/**
+ * Derive a file extension for the saved file. Telegram's `file_path` usually
+ * carries the real extension, but for a DOCUMENT it can be a generic name (or
+ * extensionless) while the original `fileName` is authoritative — so consult the
+ * real filename before falling back to a kind default, otherwise a
+ * `report.csv`/`.txt`/`.odt` saves as `.bin` and analyze_media can't detect it.
+ */
+function extFromFilePath(
+	filePath: string | undefined,
+	kind: InboundMediaAttachment["kind"],
+	fileName?: string,
+): string {
+	if (filePath) {
+		const ext = path.extname(filePath).replace(/^\./, "").toLowerCase();
+		if (ext && /^[a-z0-9]+$/.test(ext)) return ext;
+	}
+	// The original document filename is the next-best source of the real type.
+	if (fileName) {
+		const ext = path.extname(fileName).replace(/^\./, "").toLowerCase();
+		if (ext && /^[a-z0-9]+$/.test(ext)) return ext;
+	}
+	// Sensible default by kind when nothing carried an extension.
+	switch (kind) {
+		case "image":
+			return "jpg";
+		case "video":
+			return "mp4";
+		case "voice":
+			return "ogg";
+		case "audio":
+			return "mp3";
+		case "sticker":
+			return "webp";
+		default:
+			return "bin";
+	}
+}
+
+/** Where downloaded media lands — OS cache in convex mode, channel-state dir otherwise. */
+function mediaBaseDir(): string {
+	return tryGetRuntimeContext()?.mode === "convex"
+		? path.join(resolveOsCacheDir(), "channels", CHANNEL_ID)
+		: resolveChannelStateDir(CHANNEL_ID);
+}
+
+export interface DownloadTelegramMediaArgs {
+	/** The grammY file API (`bot.api`). */
+	bot: TelegramBotFileApi;
+	/** The attachment's `file_id` (from `resolveInboundMediaFileId`). */
+	fileId: string;
+	/** Brigade media kind — drives the default extension + the returned `kind`. */
+	kind: InboundMediaAttachment["kind"];
+	/** The Bot API token — needed to build the file download URL. NEVER logged. */
+	token: string;
+	/** Optional caption to carry through to the attachment. */
+	caption?: string;
+	/** Optional original filename (documents). */
+	fileName?: string;
+	/** Injectable fetch (defaults to global fetch) — lets tests stub the download. */
+	fetchImpl?: typeof fetch;
+	/** Logger so a failed download logs without crashing the inbound flow. */
+	log?: (msg: string, meta?: Record<string, unknown>) => void;
+}
+
+/**
+ * Bounded retry for the transient steps of a media download (getFile + the file
+ * fetch). Telegram's file API and the file CDN occasionally blip on a 5xx or a
+ * network reset; one or two quick retries turn a dropped attachment into a
+ * delivered one. The caller still wraps the whole thing in a try/catch that
+ * degrades to `null`, so an exhausted retry never breaks message delivery.
+ */
+export async function withMediaRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+	let lastErr: unknown;
+	for (let i = 0; i < attempts; i++) {
+		try {
+			return await fn();
+		} catch (err) {
+			lastErr = err;
+			if (i < attempts - 1) await new Promise((r) => setTimeout(r, 200 * 2 ** i));
+		}
+	}
+	throw lastErr;
+}
+
+/**
+ * Download one inbound attachment to disk and return its normalized descriptor,
+ * or `null` when the file couldn't be fetched (too big / network error / no
+ * path). Never throws — a download glitch must not break message delivery.
+ */
+export async function downloadTelegramMedia(args: DownloadTelegramMediaArgs): Promise<InboundMediaAttachment | null> {
+	const { bot, fileId, kind, token, log } = args;
+	const doFetch = args.fetchImpl ?? fetch;
+	try {
+		const file = await withMediaRetry(() => bot.getFile(fileId));
+		const filePath = file?.file_path;
+		if (!filePath) {
+			log?.("telegram media skipped — getFile returned no file_path", { kind });
+			return null;
+		}
+		if (typeof file.file_size === "number" && file.file_size > MAX_BYTES) {
+			log?.("telegram media skipped — exceeds size cap", { kind, bytes: file.file_size, cap: MAX_BYTES });
+			return null;
+		}
+		const url = `${TELEGRAM_API_BASE}/file/bot${token}/${filePath}`;
+		// SSRF guard: `file_path` derives from an untrusted inbound message, so
+		// REFUSE any built URL that isn't https on the Telegram Bot API host before
+		// fetching. Checked BEFORE the fetch.
+		if (!isAllowedTelegramFileUrl(url)) {
+			log?.("telegram media skipped — file URL is not an allowed Telegram host (SSRF guard)", { kind });
+			return null;
+		}
+		const res = await withMediaRetry(async () => {
+			// `redirect: "manual"` so a cross-origin 30x can't carry the request off
+			// to a non-Telegram host. A redirect surfaces as a non-ok response and
+			// falls through to the `!res.ok` handler below.
+			const r = await doFetch(url, { redirect: "manual" });
+			// Retry 5xx (transient server/CDN blip); a 4xx falls through to the
+			// !ok handler below (no point retrying a permanent client error).
+			if (!r.ok && r.status >= 500) throw new Error(`telegram media fetch failed (${r.status})`);
+			return r;
+		});
+		if (!res.ok) {
+			log?.("telegram media download failed", { kind, status: res.status });
+			return null;
+		}
+		const buf = Buffer.from(await res.arrayBuffer());
+		if (buf.length === 0) return null;
+		if (buf.length > MAX_BYTES) {
+			log?.("telegram media skipped — exceeds size cap", { kind, bytes: buf.length, cap: MAX_BYTES });
+			return null;
+		}
+		const dir = path.join(mediaBaseDir(), "media", dayBucket());
+		mkdirSync(dir, { recursive: true });
+		// file_unique_id is stable across re-deliveries; use it as the filename so
+		// the same media resolves idempotently. Fall back to file_id.
+		const baseName = (file.file_unique_id || fileId).replace(/[^A-Za-z0-9_-]/g, "_");
+		const dest = path.join(dir, `${baseName}.${extFromFilePath(filePath, kind, args.fileName)}`);
+		writeFileSync(dest, buf, { mode: 0o600 });
+		return {
+			kind,
+			path: dest,
+			fileName: args.fileName,
+			caption: args.caption,
+		};
+	} catch (err) {
+		log?.("telegram media download failed", {
+			kind,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return null;
+	}
+}
+
+/**
+ * Wrap a local file path (or Buffer) in grammY's `InputFile` for an outbound
+ * send, after running the path through Brigade's outbound media-path guard.
+ * Throws a clear operator-facing error when the guard refuses the path (the
+ * `send_media` tool surfaces it). grammY is lazy-imported so this file never
+ * forces the dependency at module load.
+ */
+export async function buildTelegramInputFile(media: OutboundMedia): Promise<unknown> {
+	const verdict = validateOutboundMediaPath(media.path);
+	if (!verdict.ok) {
+		throw new Error(`Telegram: ${verdict.reason ?? "refusing to attach this file"}`);
+	}
+	const { InputFile } = await import("grammy");
+	// A local filesystem path — grammY streams it from disk. A filename override
+	// (documents) is honoured when provided.
+	return new InputFile(media.path, media.fileName);
+}
+
+export { MAX_BYTES as TELEGRAM_MEDIA_MAX_BYTES };

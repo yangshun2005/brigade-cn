@@ -1,0 +1,431 @@
+/**
+ * Normalization + defaulting layer.
+ *
+ * `ops.add` / `ops.update` take a partial `CronJobCreate` from the caller (CLI,
+ * RPC, or agent tool) and the store needs a fully-realised `CronJob` with
+ * every field decided. This file owns the defaulting rules so the timer
+ * loop, the run log, and the delivery dispatcher can all trust that
+ * downstream values are present.
+ *
+ * Defaulting rules locked from the reference architecture:
+ *   - `enabled` defaults to `true`.
+ *   - `wakeMode` defaults to `"next-heartbeat"` (less disruptive than `"now"`).
+ *   - `deleteAfterRun` defaults to `true` for `kind: "at"`, undefined otherwise.
+ *   - `sessionTarget` defaults to `"main"` for `systemEvent` payloads,
+ *     `"isolated"` for `agentTurn` payloads.
+ *   - `delivery.mode` defaults: `"none"` for `systemEvent`, `"announce"` for
+ *     `agentTurn` (so the operator sees the result by default).
+ *   - `delivery.bestEffort` defaults to `false`.
+ *   - Top-of-hour `cron` patterns get a 5-minute stagger window unless
+ *     explicit.
+ *
+ * Validation calls live in `service/jobs.ts:assertSupportedJobSpec`; this
+ * file only fills defaults + light coercion.
+ */
+
+import { parseAbsoluteTimeMs } from "./parse.js";
+import { assertSafeCronSessionTargetId } from "./session-target.js";
+import { defaultStaggerMsForCronExpression } from "./stagger.js";
+import { assertFutureAtTimestamp } from "./validate-timestamp.js";
+import type {
+	CronDelivery,
+	CronJobCreate,
+	CronPayload,
+	CronSchedule,
+	CronSessionTarget,
+	CronWakeMode,
+} from "./types.js";
+
+/** Default sessionTarget given a payload's kind. */
+export function defaultSessionTargetForPayload(payload: CronPayload): CronSessionTarget {
+	return payload.kind === "systemEvent" ? "main" : "isolated";
+}
+
+/** Default delivery mode given the payload's kind. */
+function defaultDeliveryModeForPayload(payload: CronPayload): CronDelivery["mode"] {
+	return payload.kind === "systemEvent" ? "none" : "announce";
+}
+
+/**
+ * Relative-offset → absolute `at` resolver (input-only sugar).
+ *
+ * LLMs are unreliable at producing 13-digit epoch-millisecond timestamps: a
+ * "remind me in 5 minutes" turn has the model emit `Date.now() + 300_000`
+ * from its head, and it routinely lands minutes off (observed in production:
+ * a "5 minutes" reminder got scheduled ~14 minutes out, fired late, and the
+ * operator had already given up). The model has no real `Date.now()` — the
+ * runtime prompt carries only a wall-clock + ISO string — so it GUESSES the
+ * epoch, and the reminder fires at the wrong time.
+ *
+ * The fix: let the model express the OFFSET ("in N minutes") and resolve it
+ * to an absolute fire-time SERVER-SIDE against the real clock. This is an
+ * input-only alias — exactly like `sessionTarget: "current"` — that rewrites
+ * to the canonical `{kind: "at", at: <epoch ms>}` BEFORE validation, so
+ * nothing downstream (timer, schedule math, delivery) ever sees the relative
+ * form.
+ *
+ * Recognised when the schedule object carries `kind: "in"` OR any relative
+ * field while NO absolute `at`/`atMs` is present (an explicit `at` always
+ * wins, preserving back-compat). Multiple fields SUM, so
+ * `{inHours: 1, inMinutes: 30}` = 90 minutes. A few spelling variants are
+ * accepted so a non-frontier model's phrasing still lands.
+ *
+ *   {kind: "in", inMinutes: 5}   → at = now + 5 min
+ *   {inSeconds: 90}              → at = now + 90 s
+ *   {kind: "at", inMinutes: 5}   → at = now + 5 min (relative wins; no `at`)
+ *   {kind: "at", at: 1780…}      → unchanged (absolute `at` present)
+ */
+const RELATIVE_OFFSET_FIELDS: ReadonlyArray<readonly [string, number]> = [
+	["inms", 1],
+	["inmillis", 1],
+	["inmilliseconds", 1],
+	["insec", 1000],
+	["insecs", 1000],
+	["insecond", 1000],
+	["inseconds", 1000],
+	["inmin", 60_000],
+	["inmins", 60_000],
+	["inminute", 60_000],
+	["inminutes", 60_000],
+	["inhour", 3_600_000],
+	["inhours", 3_600_000],
+	["inhr", 3_600_000],
+	["inhrs", 3_600_000],
+	["inday", 86_400_000],
+	["indays", 86_400_000],
+];
+
+/** Sum every recognised relative-offset field (case-insensitive). Returns
+ *  `undefined` when none are present, so the caller can tell "no relative
+ *  signal" apart from "a zero offset". */
+function readRelativeOffsetMs(rec: Record<string, unknown>): number | undefined {
+	const lowerKeyed = new Map<string, unknown>();
+	for (const key of Object.keys(rec)) lowerKeyed.set(key.toLowerCase(), rec[key]);
+	let total = 0;
+	let found = false;
+	for (const [key, mult] of RELATIVE_OFFSET_FIELDS) {
+		const v = lowerKeyed.get(key);
+		if (typeof v === "number" && Number.isFinite(v)) {
+			total += v * mult;
+			found = true;
+		}
+	}
+	return found ? total : undefined;
+}
+
+/**
+ * Rewrite a relative-offset schedule input into the canonical
+ * `{kind: "at", at: <epoch ms>}` form using `nowMs`. Pass-through for any
+ * input that isn't a relative form (absolute `at`, `every`, `cron`, etc.).
+ * Throws a clear error for a `kind: "in"` with a missing / non-positive
+ * offset so the caller (agent tool / RPC) gets an actionable refusal.
+ */
+export function resolveRelativeScheduleInput(raw: unknown, nowMs: number): unknown {
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return raw;
+	const rec = raw as Record<string, unknown>;
+	const kind = typeof rec.kind === "string" ? rec.kind.toLowerCase() : undefined;
+	const hasAbsoluteAt = rec.at !== undefined || rec.atMs !== undefined;
+	const offsetMs = readRelativeOffsetMs(rec);
+	const isRelative = kind === "in" || (offsetMs !== undefined && !hasAbsoluteAt);
+	if (!isRelative) return raw;
+	if (offsetMs === undefined) {
+		throw new Error(
+			'cron relative schedule (kind "in") requires a positive offset — ' +
+				"one of inSeconds / inMinutes / inHours / inDays / inMs",
+		);
+	}
+	if (offsetMs <= 0) {
+		throw new Error(`cron relative schedule offset must be positive (got ${offsetMs} ms)`);
+	}
+	return { kind: "at", at: nowMs + offsetMs };
+}
+
+/**
+ * Coerce a permissive caller-supplied schedule into a canonical `CronSchedule`.
+ *
+ * The agent tool's TypeBox shape is `Type.Any()` so the LLM can pass any of:
+ *   - a bare string  → `"0 9 * * *"` (treated as a cron expression)
+ *   - a record missing `kind` but carrying `expr` / `cron` / `everyMs` / `at`
+ *   - the canonical `{kind: "cron", expr: "..."}` shape
+ *
+ * Without this coercion a string slipped past `normalizeSchedule` unchanged,
+ * landed on disk with no `kind`, and `computeNextRunAtMs`'s switch returned
+ * `undefined` forever — the job never fired. Migration of already-stored
+ * bad-shape schedules happens in `store.ts:ensureLoaded` using this same
+ * helper, so an operator who hit the bug on an older build doesn't have to
+ * hand-edit `~/.brigade/cron.json`.
+ */
+export function coerceScheduleInput(raw: unknown): CronSchedule {
+	if (typeof raw === "string") {
+		const expr = raw.trim();
+		if (!expr) throw new Error("cron schedule string is empty");
+		return { kind: "cron", expr };
+	}
+	if (raw === null || typeof raw !== "object") {
+		throw new Error(
+			"cron schedule must be a string (cron expr) or an object — got " + typeof raw,
+		);
+	}
+	const rec = raw as Record<string, unknown>;
+	const rawKind = typeof rec.kind === "string" ? rec.kind.toLowerCase() : undefined;
+	const validKinds = new Set(["at", "every", "cron"]);
+	const kind = rawKind && validKinds.has(rawKind) ? rawKind : undefined;
+	// Pull expression out of either `expr` or the legacy `cron` alias.
+	const rawExpr =
+		typeof rec.expr === "string"
+			? rec.expr
+			: typeof rec.cron === "string"
+				? rec.cron
+				: undefined;
+	const expr = rawExpr?.trim() || undefined;
+	const everyMs = typeof rec.everyMs === "number" ? rec.everyMs : undefined;
+	// Accept `at` OR `atMs` as the absolute timestamp field. Per reference
+	// implementation parse.ts, BOTH channels accept (a) numeric epoch ms,
+	// (b) digit-string epoch ms, and (c) ISO-8601 string with UTC fallback
+	// (bare date → midnight Z; naive date-time → append Z; tz-suffixed
+	// preserved). Failure to parse a string → undefined (caller error
+	// surfaces below in the kind-"at" branch).
+	const atMsRaw = rec.atMs;
+	const atRaw = rec.at;
+	const atString = typeof atRaw === "string" ? atRaw.trim() : "";
+	const atMsString = typeof atMsRaw === "string" ? atMsRaw.trim() : "";
+	const at: number | undefined =
+		typeof atMsRaw === "number" && Number.isFinite(atMsRaw)
+			? Math.floor(atMsRaw)
+			: atMsString
+				? (parseAbsoluteTimeMs(atMsString) ?? undefined)
+				: typeof atRaw === "number" && Number.isFinite(atRaw)
+					? Math.floor(atRaw)
+					: atString
+						? (parseAbsoluteTimeMs(atString) ?? undefined)
+						: undefined;
+	// A bare ISO string on `at` or `atMs` is enough to infer kind "at" — the
+	// reference normalizer auto-detects this even when `kind` is omitted.
+	const hasAtSignal =
+		at !== undefined ||
+		atString.length > 0 ||
+		atMsString.length > 0 ||
+		typeof atMsRaw === "number";
+	// Infer kind from whichever discriminator field is present.
+	const inferredKind =
+		kind ??
+		(hasAtSignal
+			? "at"
+			: everyMs !== undefined
+				? "every"
+				: expr
+					? "cron"
+					: undefined);
+	if (!inferredKind) {
+		throw new Error(
+			"cron schedule object needs at least one of: kind, expr, everyMs, at",
+		);
+	}
+	switch (inferredKind) {
+		case "at": {
+			if (at === undefined) {
+				throw new Error(
+					'cron schedule kind "at" requires `at` as ISO-8601 string ' +
+						"OR epoch ms (number, or numeric/atMs string)",
+				);
+			}
+			// Future-time validation runs at the `defaultCronJobCreate` layer
+			// (NOT here) so the bare coerce remains a pure shape-coercer that
+			// callers can use to canonicalise a stored / historical schedule
+			// without tripping the grace-window guard.
+			return { kind: "at", at };
+		}
+		case "every": {
+			if (everyMs === undefined) {
+				throw new Error('cron schedule kind "every" requires a numeric `everyMs`');
+			}
+			const anchorMs = typeof rec.anchorMs === "number" ? rec.anchorMs : undefined;
+			return {
+				kind: "every",
+				everyMs,
+				...(anchorMs !== undefined ? { anchorMs } : {}),
+			};
+		}
+		case "cron": {
+			if (!expr) {
+				throw new Error('cron schedule kind "cron" requires `expr` (a cron expression)');
+			}
+			const tz = typeof rec.tz === "string" ? rec.tz : undefined;
+			const staggerMs = typeof rec.staggerMs === "number" ? rec.staggerMs : undefined;
+			return {
+				kind: "cron",
+				expr,
+				...(tz !== undefined ? { tz } : {}),
+				...(staggerMs !== undefined ? { staggerMs } : {}),
+			};
+		}
+	}
+	throw new Error(`cron schedule has unsupported kind: ${inferredKind}`);
+}
+
+/**
+ * Fill in a schedule's optional fields. For `cron` kind, applies the
+ * top-of-hour stagger default. Other kinds pass through unchanged.
+ *
+ * Always run AFTER `coerceScheduleInput` — accepts only canonical-shape
+ * schedules. Stale callers that pass a bare string slip past here unchanged
+ * (the type-guard `schedule.kind !== "cron"` is true for `undefined`), so
+ * make sure the entry point calls coerce first.
+ */
+export function normalizeSchedule(schedule: CronSchedule): CronSchedule {
+	if (schedule.kind !== "cron") return schedule;
+	if (schedule.staggerMs !== undefined) return schedule;
+	const stagger = defaultStaggerMsForCronExpression(schedule.expr);
+	if (stagger <= 0) return schedule;
+	return { ...schedule, staggerMs: stagger };
+}
+
+/**
+ * Fill in a delivery block's missing fields. Returns `undefined` only if the
+ * caller already opted out by omitting delivery AND the payload's natural
+ * default is also `none`.
+ */
+export function normalizeDelivery(
+	delivery: CronDelivery | undefined,
+	payload: CronPayload,
+): CronDelivery | undefined {
+	const mode = delivery?.mode ?? defaultDeliveryModeForPayload(payload);
+	if (mode === "none" && !delivery) return undefined;
+	return {
+		mode,
+		...(delivery?.channel !== undefined ? { channel: delivery.channel } : {}),
+		...(delivery?.to !== undefined ? { to: delivery.to } : {}),
+		...(delivery?.accountId !== undefined ? { accountId: delivery.accountId } : {}),
+		...(delivery?.threadId !== undefined ? { threadId: delivery.threadId } : {}),
+		bestEffort: delivery?.bestEffort ?? false,
+		...(delivery?.webhookUrl !== undefined ? { webhookUrl: delivery.webhookUrl } : {}),
+	};
+}
+
+/** Default wake mode for `wake` actions when the caller didn't specify. */
+export function defaultWakeMode(): CronWakeMode {
+	return "next-heartbeat";
+}
+
+/**
+ * Resolve `deleteAfterRun` for a schedule kind. Caller-supplied wins; else
+ * one-shot `at` jobs auto-delete on success, recurring jobs do not.
+ */
+export function resolveDeleteAfterRun(
+	caller: boolean | undefined,
+	schedule: CronSchedule,
+): boolean | undefined {
+	if (caller !== undefined) return caller;
+	return schedule.kind === "at" ? true : undefined;
+}
+
+/**
+ * Optional context the caller can thread into `defaultCronJobCreate` so the
+ * normalizer can resolve `sessionTarget: "current"` into a concrete
+ * `session:<sessionKey>` value. CLI / headless callers omit it; the agent
+ * tool (which knows its calling session) supplies it.
+ */
+export interface CronJobCreateNormalizeOpts {
+	sessionContext?: {
+		/** Caller's session key — used to resolve `sessionTarget: "current"`. */
+		sessionKey?: string;
+	};
+	/**
+	 * Optional scheduler-virtual clock for `kind: "at"` future-time validation.
+	 * Production callers pass `state.deps.nowMs!()`; tests that drive a
+	 * simulated clock pass their virtual time. Omit to use `Date.now()`.
+	 */
+	nowMs?: number;
+}
+
+/**
+ * Resolve a possibly-aliased `sessionTarget` into the persisted form.
+ *
+ *   - `"current"` + session context → `session:<sessionKey>` (safe-id guarded).
+ *   - `"current"` without context  → `"isolated"` (headless / CLI fallback).
+ *   - any other value              → returned unchanged.
+ *
+ * Mirrors the reference normalizer's create-time resolver — persisted
+ * `CronJob.sessionTarget` values are always one of
+ * `"main" | "isolated" | "session:<id>"` after this runs.
+ */
+function resolveSessionTargetAlias(
+	target: CronSessionTarget,
+	opts: CronJobCreateNormalizeOpts | undefined,
+): CronSessionTarget {
+	if (target !== "current") return target;
+	const key = opts?.sessionContext?.sessionKey?.trim();
+	if (key) {
+		// `assertSafeCronSessionTargetId` throws on path-special / control
+		// characters; we re-throw with the original error to surface the
+		// invalid-spec to the caller (matches reference behaviour).
+		assertSafeCronSessionTargetId(key);
+		return `session:${key}`;
+	}
+	return "isolated";
+}
+
+/**
+ * Produce a fully-defaulted create input — every optional field decided.
+ * Doesn't validate; that's `assertSupportedJobSpec`'s job. Doesn't write to
+ * disk; the caller (ops.add) does that.
+ *
+ * Pass `opts.sessionContext.sessionKey` to resolve `sessionTarget: "current"`
+ * into the caller's session. Existing callers that omit `opts` keep the
+ * pre-existing single-agent behaviour (no "current" → no rewrite).
+ */
+export function defaultCronJobCreate(
+	input: CronJobCreate,
+	opts?: CronJobCreateNormalizeOpts,
+): Required<Pick<CronJobCreate, "enabled" | "sessionTarget" | "wakeMode">> & CronJobCreate {
+	// Resolve a relative offset ("in 5 minutes") to an absolute `at` against
+	// the scheduler clock FIRST — so the model never has to compute a 13-digit
+	// epoch in its head (it gets that wrong; see `resolveRelativeScheduleInput`).
+	// Pass-through for absolute / every / cron inputs. Use one clock reading for
+	// both the relative resolve and the future-time guard below so they agree.
+	const nowForSchedule = opts?.nowMs ?? Date.now();
+	const relativeResolved = resolveRelativeScheduleInput(input.schedule, nowForSchedule);
+	// Coerce permissive caller input (bare string / object-without-kind) into
+	// the canonical CronSchedule shape BEFORE we touch staggerMs etc. — see
+	// `coerceScheduleInput` for the supported shapes.
+	const coerced = coerceScheduleInput(relativeResolved);
+	const schedule = normalizeSchedule(coerced);
+	// Future-time validation on the create-path ONLY (not on the bare
+	// coercer, which is also used for shape-canonicalising stored / replayed
+	// schedules). Reject `at` jobs whose timestamp is past / current-minute
+	// / within the no-fire grace window so an AM/PM-ambiguous parse
+	// (e.g. "12:27 AM" at 12:27 PM) gets a clear retry signal instead of
+	// silently being persisted with `nextRunAtMs: undefined`. Threads
+	// `opts.nowMs` so simulated-clock tests use the scheduler's virtual
+	// time rather than wall-clock `Date.now()`.
+	if (schedule.kind === "at") {
+		assertFutureAtTimestamp(schedule.at, nowForSchedule);
+	}
+	const sessionTargetRaw =
+		input.sessionTarget ?? defaultSessionTargetForPayload(input.payload);
+	// Resolve `"current"` → `session:<id>` (or `"isolated"` when no session
+	// context is available). Persisted value is never `"current"`.
+	const sessionTarget = resolveSessionTargetAlias(sessionTargetRaw, opts);
+	const wakeMode = input.wakeMode ?? defaultWakeMode();
+	const delivery = normalizeDelivery(input.delivery, input.payload);
+	const deleteAfterRun = resolveDeleteAfterRun(input.deleteAfterRun, schedule);
+	// Stamp `sessionKey` from the caller's input OR from the session context.
+	// Without this, an agent-tool call that resolves `sessionTarget: "current"`
+	// to `session:<key>` leaves `job.sessionKey` undefined — downstream
+	// failure-alert / announce-fallback routing then can't find the caller's
+	// session and routes back to default-agent's main session instead.
+	const resolvedSessionKey =
+		typeof input.sessionKey === "string" && input.sessionKey.trim().length > 0
+			? input.sessionKey.trim()
+			: opts?.sessionContext?.sessionKey?.trim();
+	return {
+		...input,
+		schedule,
+		sessionTarget,
+		wakeMode,
+		enabled: input.enabled ?? true,
+		...(delivery !== undefined ? { delivery } : {}),
+		...(deleteAfterRun !== undefined ? { deleteAfterRun } : {}),
+		...(resolvedSessionKey ? { sessionKey: resolvedSessionKey } : {}),
+	};
+}

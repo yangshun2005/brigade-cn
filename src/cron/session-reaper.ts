@@ -1,0 +1,267 @@
+/**
+ * 24h retention pruner for isolated cron run sessions.
+ *
+ * Isolated cron runs create a fresh session per fire — over weeks of
+ * scheduled traffic, the JSONL transcripts pile up. The reaper sweeps
+ * the session-store + transcript files for keys matching
+ * `cron:<jobId>:run:<uuid>` whose last-used timestamp is older than the
+ * retention window, then deletes both halves.
+ *
+ * Hard-rules:
+ *   - Only touches ISOLATED cron run sessions. Base cron sessions
+ *     (`cron:<jobId>`) and named-target sessions (`cron:<jobId>:<name>`,
+ *     without a `:run:` segment) are kept indefinitely — operators may
+ *     want their full history.
+ *   - When the config says `sessionRetention: false`, the reaper is a
+ *     no-op. Operators can opt-out by setting that to `false` in
+ *     `brigade.json`.
+ *   - Best-effort: a single bad entry doesn't abort the sweep. Errors
+ *     are logged + the sweep continues.
+ *
+ * Called from the cron timer's tick path (`service/timer.ts:onTimer`)
+ * with self-throttling (`MIN_SWEEP_INTERVAL_MS = 5 min`) so a per-second
+ * tick storm doesn't hammer the filesystem.
+ */
+
+import { promises as fs } from "node:fs";
+
+import {
+	deleteSessionEntry,
+	readSessionStore,
+} from "../sessions/session-store.js";
+import { resolveSessionTranscriptPath } from "../config/paths.js";
+import { tryGetRuntimeContext } from "../storage/runtime-context.js";
+import type { SubsystemLogger } from "../logging/subsystem-logger.js";
+
+/** Default retention if `sessionRetention` is left as the string default. */
+export const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+/** Minimum gap between sweeps when called from the tick loop. */
+export const MIN_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
+/** `false` disables pruning entirely; a string like "24h" gets parsed. */
+export function parseSessionRetention(spec: string | false | undefined): number | null {
+	if (spec === false) return null; // disabled
+	if (spec === undefined || spec === null) return DEFAULT_RETENTION_MS;
+	const trimmed = spec.trim();
+	if (!trimmed) return DEFAULT_RETENTION_MS;
+	const m = trimmed.match(/^(\d+)\s*(s|m|h|d|w)$/i);
+	if (!m) return DEFAULT_RETENTION_MS;
+	const n = Number(m[1]);
+	const unit = (m[2] ?? "h").toLowerCase();
+	const multiplier: Record<string, number> = {
+		s: 1_000,
+		m: 60_000,
+		h: 3_600_000,
+		d: 86_400_000,
+		w: 604_800_000,
+	};
+	const mul = multiplier[unit];
+	if (mul === undefined) return DEFAULT_RETENTION_MS;
+	return n * mul;
+}
+
+/**
+ * Return true if the given session key belongs to an isolated cron RUN
+ * session (per-fire, ephemeral). Stable cron sessions and named ones are
+ * preserved across runs and skipped.
+ */
+export function isIsolatedCronRunSessionKey(sessionKey: string): boolean {
+	return /(^|:)cron:[^:]+:run:[^:]+$/.test(sessionKey);
+}
+
+/**
+ * Return true if the session key belongs to a CHANNEL THREAD (Telegram forum
+ * topic, Slack/Discord thread). Thread session keys carry a `:thread:<id>`
+ * suffix (see `routing/session-key.ts`'s `resolveThreadSessionKeys`). These are
+ * ephemeral by nature — a forum topic goes quiet and the session never gets
+ * re-used — so an opt-in idle TTL can age them out. The base (non-thread)
+ * session is NEVER matched, so a peer's main conversation is always preserved.
+ */
+export function isThreadSessionKey(sessionKey: string): boolean {
+	return /:thread:[^:]+$/.test(sessionKey);
+}
+
+export interface ReapSweepArgs {
+	agentId: string;
+	retentionMs: number;
+	nowMs: number;
+	log: SubsystemLogger;
+	/**
+	 * Drop the gateway's in-memory state for a reaped session.
+	 *
+	 * The sweep deletes the store entry and the transcript, but the usage
+	 * ledger, reasoning tracker, frame ring and session caches are keyed by
+	 * session and live in the gateway's memory — so without this their rows
+	 * outlive the session that owned them. `sessions.delete` has always cleared
+	 * them; the reaper never did, so the maps grew by one row per reaped cron
+	 * fire and idle thread.
+	 *
+	 * Optional so the reaper stays usable outside the gateway (tests, CLI).
+	 */
+	forgetSessionState?: (agentId: string, sessionKey: string) => void;
+}
+
+export interface ReapSweepResult {
+	scanned: number;
+	pruned: number;
+	transcriptsRemoved: number;
+}
+
+/**
+ * One pass. Reads sessions.json, walks every entry, deletes ones that match
+ * the cron-run pattern AND are older than `retentionMs` ago. Doesn't throw
+ * on per-entry failure — logs and moves on so a single corrupt transcript
+ * file can't block the whole sweep.
+ */
+export async function reapIsolatedCronSessions(args: ReapSweepArgs): Promise<ReapSweepResult> {
+	const { agentId, retentionMs, nowMs, log } = args;
+	const cutoff = nowMs - retentionMs;
+	const store = readSessionStore(agentId);
+	let scanned = 0;
+	let pruned = 0;
+	let transcriptsRemoved = 0;
+	for (const [sessionKey, entry] of Object.entries(store.sessions)) {
+		if (!isIsolatedCronRunSessionKey(sessionKey)) continue;
+		scanned++;
+		const lastUsed = Date.parse(entry.lastUsedAt);
+		if (!Number.isFinite(lastUsed) || lastUsed > cutoff) continue;
+		// Remove the transcript first. If the file is gone or the path
+		// resolution throws, we still proceed to drop the entry — the
+		// goal is to converge sessions.json with disk reality, not to
+		// half-leave records pointing at vanished files.
+		try {
+			const sessionIdStr = typeof entry.sessionId === "string" ? entry.sessionId : null;
+			if (sessionIdStr) {
+				// Convex mode: the raw fs.rm below only removed the OS-cache
+				// JSONL — the transcript ROWS in the backend were never
+				// deleted, so every reaped cron session accumulated rows
+				// forever. Route through the store's deleteTranscript (its
+				// local impl does the unlink, so behaviour is identical in
+				// filesystem mode; the convex impl deletes the rows).
+				const rctx = tryGetRuntimeContext();
+				if (rctx?.mode === "convex") {
+					await rctx.store.messages.deleteTranscript(agentId, sessionIdStr);
+					// Best-effort: also drop the regenerable OS-cache JSONL.
+					const transcriptPath = resolveSessionTranscriptPath(agentId, sessionIdStr);
+					await fs.rm(transcriptPath, { force: true });
+				} else {
+					const transcriptPath = resolveSessionTranscriptPath(agentId, sessionIdStr);
+					await fs.rm(transcriptPath, { force: true });
+				}
+				transcriptsRemoved++;
+			}
+		} catch (err) {
+			log.warn("reaper failed to delete transcript", {
+				sessionKey,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+		try {
+			deleteSessionEntry(agentId, sessionKey);
+			// Drop the gateway's per-session maps too — see `forgetSessionState`.
+			args.forgetSessionState?.(agentId, sessionKey);
+			pruned++;
+		} catch (err) {
+			log.warn("reaper failed to delete session entry", {
+				sessionKey,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+	if (pruned > 0) {
+		log.info("reaper pruned isolated cron sessions", {
+			agentId,
+			scanned,
+			pruned,
+			transcriptsRemoved,
+			retentionMs,
+		});
+	}
+	return { scanned, pruned, transcriptsRemoved };
+}
+
+/**
+ * One pass over CHANNEL THREAD sessions (Telegram forum topics etc.): delete
+ * the session + transcript for every `:thread:<id>` key whose last-used
+ * timestamp is older than `ttlMs` ago. Opt-in — the caller only invokes this
+ * when a `threadIdleTtlMs` is configured. Mirrors `reapIsolatedCronSessions`
+ * (best-effort, never throws on a per-entry failure) so an idle forum topic's
+ * transcript doesn't accumulate forever after the conversation goes quiet.
+ *
+ * Only thread sub-sessions are touched; a peer's BASE conversation session is
+ * never matched (it carries no `:thread:` suffix), so aging out an idle topic
+ * never disturbs the main chat.
+ */
+export async function reapIdleThreadSessions(args: {
+	agentId: string;
+	ttlMs: number;
+	nowMs: number;
+	log: SubsystemLogger;
+	/** See `ReapSweepArgs.forgetSessionState` — same contract. */
+	forgetSessionState?: (agentId: string, sessionKey: string) => void;
+}): Promise<ReapSweepResult> {
+	const { agentId, ttlMs, nowMs, log } = args;
+	const cutoff = nowMs - ttlMs;
+	const store = readSessionStore(agentId);
+	let scanned = 0;
+	let pruned = 0;
+	let transcriptsRemoved = 0;
+	for (const [sessionKey, entry] of Object.entries(store.sessions)) {
+		if (!isThreadSessionKey(sessionKey)) continue;
+		scanned++;
+		const lastUsed = Date.parse(entry.lastUsedAt);
+		if (!Number.isFinite(lastUsed) || lastUsed > cutoff) continue;
+		try {
+			const sessionIdStr = typeof entry.sessionId === "string" ? entry.sessionId : null;
+			if (sessionIdStr) {
+				const rctx = tryGetRuntimeContext();
+				if (rctx?.mode === "convex") {
+					await rctx.store.messages.deleteTranscript(agentId, sessionIdStr);
+					const transcriptPath = resolveSessionTranscriptPath(agentId, sessionIdStr);
+					await fs.rm(transcriptPath, { force: true });
+				} else {
+					const transcriptPath = resolveSessionTranscriptPath(agentId, sessionIdStr);
+					await fs.rm(transcriptPath, { force: true });
+				}
+				transcriptsRemoved++;
+			}
+		} catch (err) {
+			log.warn("thread-reaper failed to delete transcript", {
+				sessionKey,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+		try {
+			deleteSessionEntry(agentId, sessionKey);
+			// Drop the gateway's per-session maps too — see `forgetSessionState`.
+			args.forgetSessionState?.(agentId, sessionKey);
+			pruned++;
+		} catch (err) {
+			log.warn("thread-reaper failed to delete session entry", {
+				sessionKey,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+	if (pruned > 0) {
+		log.info("thread-reaper pruned idle thread sessions", {
+			agentId,
+			scanned,
+			pruned,
+			transcriptsRemoved,
+			ttlMs,
+		});
+	}
+	return { scanned, pruned, transcriptsRemoved };
+}
+
+/**
+ * Test-only helper to wire the reaper directly from a tick path without
+ * pulling in the full cron service. Tests can mock `nowMs` to verify
+ * cutoff calculation; production calls go through the scheduler.
+ */
+export function shouldRunSweep(lastSweepAtMs: number | undefined, nowMs: number): boolean {
+	if (lastSweepAtMs === undefined) return true;
+	return nowMs - lastSweepAtMs >= MIN_SWEEP_INTERVAL_MS;
+}

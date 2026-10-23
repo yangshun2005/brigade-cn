@@ -1,0 +1,422 @@
+/**
+ * Tool-loop detector — catches the model when it's stuck calling the same
+ * tool with the same arguments over and over. A real failure mode: the
+ * model emits `read({path: "src/foo.ts"})` 30 times in a row, burning
+ * turns and tokens without making progress.
+ *
+ * Two levels of escalation:
+ *
+ *   - WARNING (default: 10 identical calls in a row) — log it via the
+ *     `tool-blocked` bus event with `severity: "warning"` and let the
+ *     call pass through. This lets a marginally-redundant pattern
+ *     ("read X, then read X again to confirm") proceed, while still
+ *     surfacing the signal to operators / dashboards.
+ *
+ *   - CRITICAL (default: 20 identical calls in a row) — block with a
+ *     synthetic tool-result. The model sees a refusal explaining what
+ *     it was doing and gets pushed to try something different. Pi
+ *     turns the `{block: true, reason}` into a synthetic tool_result
+ *     so the model self-corrects on the next turn.
+ *
+ * State is process-singleton keyed by session key, NOT per-turn. A
+ * model that loops across turn boundaries (steer retries, content-
+ * quality re-prompts) is still detected. Memory cap: the ring buffer
+ * holds the last N tool calls per session (default 50), so a busy
+ * gateway with many sessions stays bounded.
+ *
+ * Wire it into the composed `beforeToolCall` chain BEFORE the exec-gate
+ * so a stuck model doesn't even consult the approval allowlist:
+ *
+ *   const nameGuard  = makeUnknownToolGuard(enabledToolNames);
+ *   const loopGuard  = makeToolLoopDetector({ctxRef});
+ *   const execGate   = makeExecGate({ctxRef});
+ *   session.agent.beforeToolCall = async (ctx, signal) => {
+ *     return (await nameGuard(ctx, signal))
+ *         ?? (await loopGuard(ctx, signal))
+ *         ?? (await execGate(ctx, signal));
+ *   };
+ */
+
+import * as crypto from "node:crypto";
+
+import type { BeforeToolCallContext, BeforeToolCallResult } from "@earendil-works/pi-agent-core";
+
+import { emitAgentEvent } from "./agent-event-bus.js";
+import { type BrigadeBeforeToolCallHook, normalizeToolName } from "./tool-guard.js";
+
+/**
+ * Per-session ring buffer + bucket counters. Buckets prevent log spam:
+ * once we've warned at count=10, we only warn again at 20, 30, etc.
+ */
+interface SessionLoopState {
+	/** Ring buffer of recent calls; newest at the end. */
+	calls: Array<{ key: string; ts: number }>;
+	/**
+	 * Last warning count emitted per call-key. We emit a warning every
+	 * `WARNING_BUCKET` calls past the threshold so a stuck model produces
+	 * one warning per 10 identical calls, not 100 warnings in 1 turn.
+	 * Also holds the reserved `"__turn"` key for the per-turn volume warn.
+	 */
+	lastWarnCount: Map<string, number>;
+	/**
+	 * Per-turn runaway guard. The identical-streak detector above only
+	 * catches the SAME call repeated; it misses a VARIED flail (navigate →
+	 * screenshot → click → snapshot → … with different args every time),
+	 * which is the costlier real-world failure. We track total calls within
+	 * the current turn so a runaway turn is stopped by volume regardless of
+	 * which tools/args it cycles through.
+	 */
+	turnId: string | null;
+	/** Tool calls counted in the current turn. */
+	turnCalls: number;
+	/**
+	 * Distinct call signatures seen in the CURRENT turn.
+	 *
+	 * The per-turn cap counts volume, which on its own says nothing about
+	 * whether the model is looping. This is what separates "stuck repeating one
+	 * approach" from "doing a genuinely large piece of work", so the block can
+	 * describe what actually happened instead of guessing.
+	 */
+	turnSignatures: Set<string>;
+	/** Wall-clock of the last call — fallback turn-boundary signal when runId is unset. */
+	lastCallTs: number;
+}
+
+const sessionStates = new Map<string, SessionLoopState>();
+const WARNING_BUCKET = 10;
+/**
+ * When runId is unset (or stable per-session), a gap longer than this
+ * between two calls is treated as a fresh turn so the per-turn counter
+ * doesn't bleed across unrelated turns. Within a turn, tool calls are
+ * seconds apart; between turns the operator typically pauses far longer.
+ */
+const TURN_BOUNDARY_GAP_MS = 60_000;
+
+export interface ToolLoopDetectorConfig {
+	/** Block the call after this many identical consecutive calls. Default 20. */
+	blockAfter: number;
+	/** Emit a warning at this count and every WARNING_BUCKET above it. Default 10. */
+	warnAfter: number;
+	/** Max ring-buffer size per session. Older entries fall out. Default 50. */
+	windowSize: number;
+	/**
+	 * Per-turn VOLUME warn — emit an operator-facing warning once the turn
+	 * has made this many tool calls (any tools/args). Telemetry only; passes
+	 * through. Default 30.
+	 */
+	perTurnWarnAt: number;
+	/**
+	 * Per-turn VOLUME block — refuse further tool calls once a single turn
+	 * exceeds this many calls without finishing. This is the catch-all for a
+	 * VARIED flail the identical-streak detector can't see. Set high enough
+	 * that legitimate multi-step turns (read many files, edit several) never
+	 * trip it; low enough that a runaway can't burn unbounded credits.
+	 * Default 60.
+	 */
+	perTurnBlockAt: number;
+}
+
+export const DEFAULT_TOOL_LOOP_CONFIG: ToolLoopDetectorConfig = {
+	blockAfter: 20,
+	warnAfter: 10,
+	windowSize: 50,
+	perTurnWarnAt: 30,
+	perTurnBlockAt: 60,
+};
+
+export interface ToolLoopContext {
+	runId?: string;
+	agentId?: string;
+	/**
+	 * Required for cross-turn state. Brigade's session key uniquely
+	 * identifies the JSONL transcript; loop state is keyed by it so a
+	 * model looping across turns is still detected. When unset (unit
+	 * tests), state is keyed by `"_default"`.
+	 */
+	sessionKey?: string;
+}
+
+export interface MakeToolLoopDetectorOptions {
+	ctxRef?: { value: ToolLoopContext };
+	config?: Partial<ToolLoopDetectorConfig>;
+}
+
+/**
+ * Hash the tool call's signature (name + stringified params) into a
+ * stable key so we can count repeats. JSON.stringify is enough for v1
+ * — params are always plain objects in Pi's hook. A wrapper command
+ * variation (e.g. timestamp-prefixed paths) won't collide; that's fine,
+ * those aren't loops.
+ */
+function hashToolCallSignature(toolName: string, params: unknown): string {
+	let paramsStr: string;
+	try {
+		paramsStr = JSON.stringify(params ?? {});
+	} catch {
+		paramsStr = "(unserializable)";
+	}
+	return crypto
+		.createHash("sha1")
+		.update(`${toolName}\x00${paramsStr}`)
+		.digest("hex")
+		.slice(0, 16);
+}
+
+function getOrCreateSessionState(sessionKey: string): SessionLoopState {
+	let state = sessionStates.get(sessionKey);
+	if (!state) {
+		state = { calls: [], lastWarnCount: new Map(), turnId: null, turnCalls: 0, turnSignatures: new Set(), lastCallTs: 0 };
+		sessionStates.set(sessionKey, state);
+	}
+	return state;
+}
+
+/**
+ * Count how many consecutive identical calls have just been made (in
+ * the most recent run of the ring buffer). If the last N entries are
+ * all the same key, the count is N. As soon as a different call breaks
+ * the streak, the count is 0 again.
+ */
+function countConsecutiveTail(calls: Array<{ key: string }>, key: string): number {
+	let count = 0;
+	for (let i = calls.length - 1; i >= 0; i--) {
+		if (calls[i]?.key === key) count++;
+		else break;
+	}
+	return count;
+}
+
+/**
+ * Format an ordinal — "1st", "2nd", "3rd", "4th", "11th", "22nd", etc.
+ * Used in the loop-detector's block-reason so a model that sees "the
+ * 2nd identical call" doesn't get the ungrammatical "the 2th identical
+ * call" the audit caught.
+ */
+function ordinal(n: number): string {
+	const mod100 = n % 100;
+	if (mod100 >= 11 && mod100 <= 13) return `${n}th`;
+	switch (n % 10) {
+		case 1:
+			return `${n}st`;
+		case 2:
+			return `${n}nd`;
+		case 3:
+			return `${n}rd`;
+		default:
+			return `${n}th`;
+	}
+}
+
+/**
+ * Build a beforeToolCall hook that detects loops. Returns `undefined`
+ * (pass through) by default; returns a warn-and-pass for WARNING-level
+ * streaks; returns `{block: true, reason}` only at CRITICAL.
+ *
+ * Side effects:
+ *  - Updates the per-session ring buffer for every call seen.
+ *  - Emits `tool-blocked` bus events for both warning and critical
+ *    levels (consumers can filter on `severity` if needed).
+ */
+export function makeToolLoopDetector(
+	opts: MakeToolLoopDetectorOptions = {},
+): BrigadeBeforeToolCallHook {
+	const ctxRef = opts.ctxRef ?? { value: {} as ToolLoopContext };
+	const config: ToolLoopDetectorConfig = {
+		...DEFAULT_TOOL_LOOP_CONFIG,
+		...(opts.config ?? {}),
+	};
+	const emitLoopEvent = (toolName: string, reason: string): void => {
+		const c = ctxRef.value;
+		emitAgentEvent({
+			type: "tool-blocked",
+			runId: c.runId ?? "",
+			agentId: c.agentId ?? "",
+			toolName,
+			reason,
+		});
+	};
+	return async (ctx: BeforeToolCallContext): Promise<BeforeToolCallResult | undefined> => {
+		const rawName = (ctx as { toolCall?: { name?: unknown }; name?: unknown })?.toolCall?.name
+			?? (ctx as { name?: unknown })?.name
+			?? "";
+		// Shared normaliser — keyed identically to the unknown-tool guard
+		// and exec-gate so a model that emits `Read` / `READ` / `  read  `
+		// hashes to the same ring-buffer entry. Without this, the model
+		// could oscillate between casings to dodge the detector.
+		const name = normalizeToolName(rawName);
+		if (!name) return undefined;
+
+		const args = (ctx as { toolCall?: { arguments?: unknown }; args?: unknown; arguments?: unknown })
+			?.toolCall?.arguments
+			?? (ctx as { args?: unknown })?.args
+			?? (ctx as { arguments?: unknown })?.arguments
+			?? {};
+
+		const sessionKey = ctxRef.value.sessionKey ?? "_default";
+		const state = getOrCreateSessionState(sessionKey);
+		const key = hashToolCallSignature(name, args);
+
+		// ── Per-turn runaway guard ──────────────────────────────────────
+		// Catches the VARIED flail the identical-streak detector below can't
+		// see: a model cycling navigate → screenshot → click → snapshot → …
+		// with different args each time, never converging. Scoped to the
+		// current turn via runId (falls back to a wall-clock gap when runId
+		// is unset) so counts never bleed across unrelated turns.
+		const runId = (ctxRef.value.runId ?? "").trim();
+		const now = Date.now();
+		const isNewTurn =
+			state.turnId === null ||
+			(runId !== "" && runId !== state.turnId) ||
+			(state.lastCallTs > 0 && now - state.lastCallTs > TURN_BOUNDARY_GAP_MS);
+		if (isNewTurn) {
+			state.turnId = runId;
+			state.turnCalls = 0;
+			state.turnSignatures.clear();
+			state.lastWarnCount.delete("__turn");
+		}
+		state.lastCallTs = now;
+		state.turnCalls += 1;
+		// Recorded AFTER the turn-boundary reset above, so it measures this turn.
+		state.turnSignatures.add(key);
+
+		if (state.turnCalls >= config.perTurnBlockAt) {
+			// Reset so the model isn't re-blocked on every subsequent call —
+			// the block is a teaching signal, not a permanent wall; the next
+			// call starts a fresh per-turn budget.
+			const blockedAt = state.turnCalls;
+			const distinct = state.turnSignatures.size;
+			state.turnCalls = 0;
+			state.turnSignatures.clear();
+			state.lastWarnCount.delete("__turn");
+			// SAY WHAT WAS MEASURED. DO NOT DIAGNOSE.
+			//
+			// This cap counts VOLUME and nothing else. The old wording asserted
+			// "you're repeating variations of the same approach" on every trip —
+			// a claim the guard never checked, and one that is plainly false for a
+			// refactor touching thirty files. It is a costly falsehood, because it
+			// then orders the model to stop and report partial results: real work
+			// truncated on a diagnosis nothing verified.
+			//
+			// The tempting fix — infer a loop from a low distinct-call count — is
+			// also wrong, and the tests below say why. This guard exists for a
+			// VARIED flail (browser navigate → screenshot → click, drifting args
+			// every time), which has a high distinct count and is still a loop. A
+			// heuristic would have excused the exact incident it was built for.
+			//
+			// So: state the fact, report the distinct count as evidence the
+			// operator and model can weigh, and give an instruction that is right
+			// either way. Whether this was a loop or a genuinely large task, the
+			// budget is spent and wrapping up is the correct next move.
+			const reason =
+				`Brigade stopped this turn at ${blockedAt} tool calls without a final answer ` +
+				`(${distinct} of them distinct). The per-turn budget is spent — this may be a loop, ` +
+				`or a task larger than one turn; either way, stop calling tools now. Report what you ` +
+				`have done and what remains, so the operator can decide whether to continue. ` +
+				`Your next message starts a fresh budget.`;
+			emitLoopEvent(name, reason);
+			return { block: true, reason };
+		}
+		if (state.turnCalls >= config.perTurnWarnAt) {
+			const lastTurnWarn = state.lastWarnCount.get("__turn") ?? 0;
+			if (state.turnCalls - lastTurnWarn >= WARNING_BUCKET || lastTurnWarn === 0) {
+				state.lastWarnCount.set("__turn", state.turnCalls);
+				emitLoopEvent(
+					name,
+					`High tool-call volume this turn (${state.turnCalls} calls) without finishing. ` +
+						`If you're not converging on an answer, stop and report what you have rather ` +
+						`than trying more variations.`,
+				);
+			}
+			// Telemetry only — passes through to the identical-streak checks.
+		}
+
+		// Count BEFORE appending so the new call is included in the streak.
+		// (If we counted after, an identical call would always show count=1
+		// less than reality and the threshold checks would be off-by-one.)
+		const consecutiveBefore = countConsecutiveTail(state.calls, key);
+		const consecutive = consecutiveBefore + 1;
+
+		// CRITICAL — block. We DON'T append to the ring buffer in this
+		// branch (and we WIPE the existing streak) so a model that keeps
+		// hammering identical calls after the block doesn't see "the 21st
+		// identical call, the 22nd identical call, …" forever. The block
+		// is meant to *teach* the model to stop; once it's emitted, the
+		// next identical call either (a) sees a fresh streak and gets
+		// blocked again with the same threshold, or (b) gets a chance
+		// to make progress without bus-event spam. We do clear the
+		// warn-bucket counter for the same reason — the ladder restarts.
+		if (consecutive >= config.blockAfter) {
+			state.calls = [];
+			state.lastWarnCount.delete(key);
+			const reason =
+				`Tool "${name}" was blocked: this is the ${ordinal(consecutive)} identical call ` +
+				`to "${name}" in a row with the same arguments. Brigade detects this as a ` +
+				`tool-call loop — the model is stuck. Stop calling "${name}" with these ` +
+				`exact arguments. Either (a) inspect the result you've already received ` +
+				`and synthesise an answer from it, (b) try a DIFFERENT tool, or (c) ` +
+				`change the arguments materially (different path, different command, ` +
+				`different query). If you genuinely need to call this tool again with ` +
+				`the same arguments, explain WHY in your reply first.`;
+			emitLoopEvent(name, reason);
+			return { block: true, reason };
+		}
+
+		// Below the block threshold — record the call so the NEXT call
+		// sees the right history. Eviction keeps memory bounded.
+		state.calls.push({ key, ts: Date.now() });
+		if (state.calls.length > config.windowSize) {
+			state.calls.shift();
+		}
+
+		// WARNING — emit but pass through. Rate-limited to one event per
+		// WARNING_BUCKET (default 10) calls past warnAfter so we don't
+		// flood the bus on a deep loop.
+		if (consecutive >= config.warnAfter) {
+			const lastWarn = state.lastWarnCount.get(key) ?? 0;
+			if (consecutive - lastWarn >= WARNING_BUCKET || lastWarn === 0) {
+				state.lastWarnCount.set(key, consecutive);
+				const reason =
+					`Tool "${name}" loop warning: ${ordinal(consecutive)} identical consecutive call. ` +
+					`Continuing for now, but if this reaches ${config.blockAfter} the call will be ` +
+					`refused. Consider whether you actually need to call "${name}" again with ` +
+					`the same arguments.`;
+				emitLoopEvent(name, reason);
+			}
+			return undefined;
+		}
+
+		return undefined;
+	};
+}
+
+/**
+ * Drop the loop-detection ring buffer for a single session. Call this
+ * when a session ends (e.g. operator closes the TUI, gateway client
+ * disconnects, sub-agent run completes) so a long-lived gateway
+ * doesn't accumulate per-session state forever.
+ *
+ * In v1 we don't have a session-end hook wired anywhere — the natural
+ * caller is the gateway when it tears down a `BrigadeClient` and a
+ * future sub-agent runner when its spawn returns. Until then, the
+ * function is exported for callers and tested in isolation; v1
+ * memory growth is bounded at ~1.6 KB per session (50-entry ring
+ * buffer × ~32 bytes per entry).
+ */
+export function dropToolLoopSession(sessionKey: string): void {
+	sessionStates.delete(sessionKey);
+}
+
+/**
+ * Test-only helper. Wipes all per-session state so tests start from a
+ * clean slate without leaking between cases.
+ */
+export function __resetToolLoopStateForTests(): void {
+	sessionStates.clear();
+}
+
+/**
+ * Test/debug helper: how many sessions have state right now.
+ */
+export function __toolLoopSessionCount(): number {
+	return sessionStates.size;
+}

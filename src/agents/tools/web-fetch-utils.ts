@@ -1,0 +1,675 @@
+/**
+ * HTML → markdown extraction utilities.
+ *
+ * Two-tier pipeline lifted from the upstream reference:
+ *
+ *   1. **Primary** — `extractReadableContent`: Mozilla Readability + linkedom
+ *      (both lazy-loaded so the agent loop doesn't pay the parse cost on a
+ *      cold start). Readability scores the DOM, picks the "article" node,
+ *      and returns its inner HTML; we then hand-roll that to markdown via
+ *      regex (NOT Turndown — Turndown is heavy + opinionated, the regex
+ *      pipeline below is ~80 LOC and good-enough for the LLM consumer).
+ *
+ *   2. **Fallback** — `extractBasicHtmlContent`: dependency-free visible-text
+ *      extraction used when Readability returns nothing (very-small pages,
+ *      single-page apps with no semantic markup, malformed HTML). Tag removal
+ *      goes through `stripHtmlTags`, a scanner rather than a `replace` — see
+ *      its doc comment for why a one-shot regex strip is unsound here.
+ *
+ * `sanitizeHtml` runs BEFORE either extractor to strip hidden content,
+ * scripts/styles, and invisible-Unicode prompt-injection vectors. The
+ * sanitizer is the single most load-bearing thing in this file — without it
+ * an attacker page can hide instructions inside `<div hidden>...</div>` or
+ * style-hidden divs and the markdown converter would surface them.
+ */
+
+import { truncateText } from "./web-shared.js";
+
+/* ─────────────────────────── lazy deps ─────────────────────────── */
+
+/**
+ * The shape Readability needs from a parsed document — basically any
+ * `linkedom`/`jsdom` Document. We type it permissively so the lazy load
+ * doesn't pull DOM type definitions into the build.
+ */
+type DocumentLike = object;
+
+interface ReadabilityModule {
+	Readability: new (
+		doc: DocumentLike,
+		options?: { charThreshold?: number; classesToPreserve?: string[]; keepClasses?: boolean },
+	) => {
+		parse(): { title?: string | null; content?: string | null; textContent?: string | null } | null;
+	};
+}
+interface LinkedomModule {
+	parseHTML: (html: string) => { document: DocumentLike };
+}
+
+let readabilityP: Promise<ReadabilityModule> | null = null;
+let linkedomP: Promise<LinkedomModule> | null = null;
+
+async function loadReadability(): Promise<ReadabilityModule> {
+	if (!readabilityP) {
+		readabilityP = (import("@mozilla/readability") as unknown as Promise<ReadabilityModule>).catch(
+			(err) => {
+				readabilityP = null;
+				throw err;
+			},
+		);
+	}
+	return readabilityP;
+}
+
+async function loadLinkedom(): Promise<LinkedomModule> {
+	if (!linkedomP) {
+		linkedomP = (import("linkedom") as unknown as Promise<LinkedomModule>).catch((err) => {
+			linkedomP = null;
+			throw err;
+		});
+	}
+	return linkedomP;
+}
+
+/* ─────────────────────────── sanitizer ─────────────────────────── */
+
+/** Tags that get fully removed before extraction (content + all). */
+const STRIPPABLE_TAGS = [
+	"script",
+	"style",
+	"noscript",
+	"iframe",
+	"object",
+	"embed",
+	"canvas",
+	"svg",
+	"template",
+	"meta",
+	"link",
+];
+
+/**
+ * Class names that signal screen-reader-only / visually-hidden content.
+ * Matched substring-wise on the class attribute so `sr-only my-class` hits.
+ */
+const HIDDEN_CLASS_HINTS = [
+	"sr-only",
+	"visually-hidden",
+	"visuallyhidden",
+	"screen-reader-only",
+	"screen-reader-text",
+	"hidden-text",
+	// Bootstrap / Tailwind / utility frameworks
+	"d-none",
+	"hide",
+	"is-hidden",
+	"invisible",
+	"offscreen",
+];
+
+/**
+ * Pre-extraction sanitizer. Strips:
+ *   1. `<script>/<style>/<noscript>/<iframe>/<object>/<embed>/<canvas>/<svg>/<template>/<meta>/<link>` (tag + contents)
+ *   2. HTML comments
+ *   3. `<input type="hidden">`
+ *   4. Elements with `hidden` attribute, `aria-hidden="true"`, or inline-style
+ *      hidden patterns (`display:none`, `visibility:hidden`, `opacity:0`,
+ *      `font-size:0`, `text-indent:-9999px`, `clip-path: inset(50%)`,
+ *      `transform: scale(0)`, off-screen positioning)
+ *   5. Elements with `class*="sr-only"` / `visually-hidden` etc.
+ *   6. Invisible-Unicode codepoints in the final text (zero-width joiners,
+ *      RTL overrides, tag-namespace characters) — defends against
+ *      prompt-injection-via-glyph-substitution.
+ *
+ * Pure regex — no DOM parsing. Fast (one pass per pattern), no allocations
+ * beyond the working string. Some edge cases (e.g. self-closing tags
+ * inside attributes) aren't covered; the linkedom-backed extractor handles
+ * those because it's a real parser, and the sanitizer is "good enough"
+ * for the basic-HTML fallback path.
+ */
+export function sanitizeHtml(html: string): string {
+	let out = html;
+	// Strip tag-blocks (open + body + close).
+	for (const tag of STRIPPABLE_TAGS) {
+		const re = new RegExp(`<${tag}\\b[\\s\\S]*?<\\/${tag}>`, "gi");
+		out = out.replace(re, "");
+		// Self-closing variants.
+		const selfRe = new RegExp(`<${tag}\\b[^>]*\\/?>`, "gi");
+		out = out.replace(selfRe, "");
+	}
+	// Strip HTML comments — including ones spanning multiple lines. Accept both
+	// the standard `-->` and the spec's legacy `--!>` terminator, and drop an
+	// unterminated trailing `<!--` so a crafted page can't smuggle markup past a
+	// comment that never closes.
+	out = out.replace(/<!--[\s\S]*?(?:--!?>|$)/g, "");
+	// Strip <input type="hidden" …>.
+	out = out.replace(/<input\b[^>]*type=["']hidden["'][^>]*>/gi, "");
+	// Strip elements with hidden / aria-hidden / hidden-class / hidden-style.
+	out = stripHiddenByAttribute(out, "hidden");
+	out = stripHiddenByAttribute(out, "aria-hidden", "true");
+	out = stripHiddenByClass(out);
+	out = stripHiddenByInlineStyle(out);
+	return out;
+}
+
+/** Drop elements where attribute `attrName` is present (optionally with `value`). */
+function stripHiddenByAttribute(html: string, attrName: string, value?: string): string {
+	// Matches <tag … attrName=…>…</tag> (loose; doesn't recurse into nested same-tag).
+	const valPart = value ? `=["']${value}["']` : `(?:=["'][^"']*["'])?`;
+	const re = new RegExp(
+		`<([a-z][a-z0-9-]*)\\b[^>]*\\b${attrName}\\b${valPart}[^>]*>[\\s\\S]*?<\\/\\1>`,
+		"gi",
+	);
+	return html.replace(re, "");
+}
+
+/** Drop elements whose class attribute matches one of the hidden-class hints. */
+function stripHiddenByClass(html: string): string {
+	const hintRe = HIDDEN_CLASS_HINTS.map((h) => h.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+	const re = new RegExp(
+		`<([a-z][a-z0-9-]*)\\b[^>]*class=["'][^"']*\\b(?:${hintRe})\\b[^"']*["'][^>]*>[\\s\\S]*?<\\/\\1>`,
+		"gi",
+	);
+	return html.replace(re, "");
+}
+
+/** Drop elements whose inline `style` looks hidden. */
+function stripHiddenByInlineStyle(html: string): string {
+	const hiddenStyleHints = [
+		/display\s*:\s*none/i,
+		/visibility\s*:\s*hidden/i,
+		/opacity\s*:\s*0(?:\.0+)?(?:[^.\d]|$)/i,
+		/font-size\s*:\s*0(?:px|em|%)?(?:[^.\d]|$)/i,
+		/text-indent\s*:\s*-?\d{4,}px/i,
+		/clip-path\s*:\s*inset\(\s*50%/i,
+		/transform\s*:\s*scale\(\s*0\b/i,
+		/(?:left|top)\s*:\s*-\d{4,}px/i,
+		// Off-screen via translate. Spam pages hide instructions like this.
+		/transform\s*:\s*translate(?:x|y)?\(\s*-?\d{4,}px/i,
+		// Color-transparency tricks — text is rendered but invisible.
+		/color\s*:\s*transparent\b/i,
+		/color\s*:\s*rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*0(?:\.0+)?\s*\)/i,
+		/color\s*:\s*hsla?\(\s*[\d.]+\s*,\s*[\d.]+%?\s*,\s*[\d.]+%?\s*,\s*0(?:\.0+)?\s*\)/i,
+		// 0×0 + overflow:hidden combo (common screen-reader-hide pattern
+		// but also used by injection attacks to smuggle text).
+		/width\s*:\s*0\s*(?:px|em|%)?\s*;\s*height\s*:\s*0/i,
+	];
+	const re = /<([a-z][a-z0-9-]*)\b[^>]*style=["']([^"']*)["'][^>]*>[\s\S]*?<\/\1>/gi;
+	return html.replace(re, (match, _tag, style: string) => {
+		return hiddenStyleHints.some((h) => h.test(style)) ? "" : match;
+	});
+}
+
+/**
+ * Remove invisible Unicode codepoints from final text — zero-width joiners,
+ * RTL/LTR overrides, tag-namespace characters. Hostile pages use these to
+ * smuggle instructions into seemingly-innocent prose. Apply to the FINAL
+ * markdown output, not the raw HTML (the HTML legitimately may contain
+ * &#8203;-style entities that decode to invisible chars).
+ */
+export function stripInvisibleUnicode(text: string): string {
+	// Build the regex from numeric ranges at runtime — avoids any chance
+	// of literal-codepoint regex classes being mangled by editor encoding.
+	// Covers (in order): zero-width space + joiner + non-joiner + RTL/LTR
+	// marks (U+200B..U+200F); embedding/pop/override (U+202A..U+202E);
+	// word joiner + invisible-math operators + function-application
+	// (U+2060..U+2065); isolate marks (U+2066..U+2069); deprecated
+	// inhibit/activate-formatting (U+206A..U+206F); BOM (U+FEFF);
+	// tag-namespace characters used in invisible-tag attacks
+	// (U+E0000..U+E007F). All ranges close on the visible end of common
+	// prompt-injection-via-glyph attacks.
+	const bmpRanges: ReadonlyArray<readonly [number, number]> = [
+		[0x200B, 0x200F],
+		[0x202A, 0x202E],
+		[0x2060, 0x2065],
+		[0x2066, 0x2069],
+		[0x206A, 0x206F],
+		[0xFEFF, 0xFEFF],
+	];
+	const out: string[] = [];
+	for (const ch of text) {
+		const code = ch.codePointAt(0) ?? 0;
+		let drop = false;
+		for (const range of bmpRanges) {
+			if (code >= range[0] && code <= range[1]) { drop = true; break; }
+		}
+		if (!drop && code >= 0xE0000 && code <= 0xE007F) drop = true;
+		if (!drop) out.push(ch);
+	}
+	return out.join("");
+}
+
+/**
+ * Scrub literal envelope marker tokens from incoming content. If an
+ * attacker page emits the exact open/close markers used by
+ * `wrapWebContent` inside its own body, it can pose as a marker boundary
+ * and trick the model into treating subsequent text as instructions.
+ *
+ * Defenses applied in order:
+ *   1. Strip invisible Unicode so zero-width chars can't break up the
+ *      marker token (e.g. `<<<EXTER​NAL_UNTRUSTED_CONTENT>>>` with a
+ *      ZWSP after the R wouldn't match a naive regex).
+ *   2. Normalize ASCII-homoglyphs (fullwidth, mathematical-style chars)
+ *      to their plain-ASCII equivalents before pattern matching.
+ *   3. Match-and-replace the canonical marker forms.
+ *
+ * Returns content with any marker (real or spoofed) redacted to a
+ * placeholder. NOTE: this normalization is per-call defensive — it does
+ * NOT mutate the document's actual text; only the spoof-suspicion paths
+ * see the normalized form.
+ */
+export function stripEnvelopeMarkers(text: string): string {
+	const probe = normalizeHomoglyphs(stripInvisibleUnicode(text));
+	if (!/EXTERNAL_UNTRUSTED_CONTENT/i.test(probe)) return text;
+	// Build a regex tolerant of mixed spacing + case + underscore/space
+	// variants. This catches `external_untrusted_content`, `EXTERNAL
+	// UNTRUSTED CONTENT`, plus homoglyph reconstructions.
+	const tokenOpen = /<<<\s*EXTERNAL[_\s]+UNTRUSTED[_\s]+CONTENT\b[^>]*>>>/gi;
+	const tokenClose = /<<<\s*END[_\s]+EXTERNAL[_\s]+UNTRUSTED[_\s]+CONTENT\b[^>]*>>>/gi;
+	const stripped = stripInvisibleUnicode(text);
+	const normalized = normalizeHomoglyphs(stripped);
+	return normalized
+		.replace(tokenClose, "[redacted-end-marker]")
+		.replace(tokenOpen, "[redacted-marker]");
+}
+
+/**
+ * Map common Unicode homoglyphs back to plain ASCII for marker detection.
+ * The output is NOT meant to be human-readable; it's an internal
+ * normalized form so spoofed markers (using fullwidth `Ｅ` instead of `E`,
+ * or `‹` instead of `<`) can be caught by ASCII regex.
+ */
+function normalizeHomoglyphs(text: string): string {
+	let out = "";
+	for (const ch of text) {
+		const code = ch.codePointAt(0) ?? 0;
+		// ASCII passes through.
+		if (code < 0x80) {
+			out += ch;
+			continue;
+		}
+		// Fullwidth Latin A-Z (U+FF21..U+FF3A) → ASCII A-Z.
+		if (code >= 0xFF21 && code <= 0xFF3A) {
+			out += String.fromCharCode(code - 0xFF21 + 0x41);
+			continue;
+		}
+		// Fullwidth Latin a-z (U+FF41..U+FF5A) → ASCII a-z.
+		if (code >= 0xFF41 && code <= 0xFF5A) {
+			out += String.fromCharCode(code - 0xFF41 + 0x61);
+			continue;
+		}
+		// Fullwidth digits + punctuation (U+FF00..U+FF20).
+		if (code >= 0xFF01 && code <= 0xFF20) {
+			out += String.fromCharCode(code - 0xFF00 + 0x20);
+			continue;
+		}
+		// Common bracket / angle homoglyphs.
+		switch (ch) {
+			case "‹": out += "<"; continue;
+			case "›": out += ">"; continue;
+			case "«": out += "<"; continue;
+			case "»": out += ">"; continue;
+			case "⟨": out += "<"; continue;
+			case "⟩": out += ">"; continue;
+			case "＜": out += "<"; continue;
+			case "＞": out += ">"; continue;
+			case "‒": out += "-"; continue;
+			case "–": out += "-"; continue;
+			case "—": out += "-"; continue;
+			case "_": out += "_"; continue;
+			case " ": out += " "; continue;
+			case "　": out += " "; continue;
+			default: break;
+		}
+		// Drop everything else from the probe so it can't ride along with
+		// adjacent ASCII to evade the regex.
+		out += ch;
+	}
+	return out;
+}
+
+/* ─────────────────────────── html → markdown ─────────────────────────── */
+
+/**
+ * Hand-rolled HTML→markdown via regex. NOT Turndown — Turndown is ~120 KB
+ * + opinions we don't need. This converter handles the ~12 tags that
+ * actually matter for LLM consumption (headings, paragraphs, links,
+ * lists, code, blockquotes, emphasis) and stuffs the rest as plain text.
+ *
+ * Input is expected to be ALREADY sanitized (no `<script>`/`<style>`).
+ */
+export function htmlToMarkdown(html: string): string {
+	let out = html;
+	// Decode common HTML entities to their text equivalent.
+	out = decodeHtmlEntities(out);
+	// Headings — h1 → #, h2 → ##, …, h6 → ######.
+	for (let i = 6; i >= 1; i -= 1) {
+		const hashes = "#".repeat(i);
+		const re = new RegExp(`<h${i}\\b[^>]*>([\\s\\S]*?)<\\/h${i}>`, "gi");
+		out = out.replace(re, (_m, body: string) => `\n\n${hashes} ${stripHtmlTags(body).trim()}\n\n`);
+	}
+	// Code blocks — `<pre><code>…</code></pre>` → fenced block.
+	out = out.replace(/<pre\b[^>]*><code\b[^>]*>([\s\S]*?)<\/code><\/pre>/gi, (_m, body: string) => {
+		return `\n\n\`\`\`\n${decodeHtmlEntities(body).trim()}\n\`\`\`\n\n`;
+	});
+	// Inline code.
+	out = out.replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, (_m, body: string) => {
+		return `\`${decodeHtmlEntities(body).replace(/\s+/g, " ").trim()}\``;
+	});
+	// Blockquotes.
+	out = out.replace(/<blockquote\b[^>]*>([\s\S]*?)<\/blockquote>/gi, (_m, body: string) => {
+		const inner = stripHtmlTags(body).trim();
+		return `\n\n${inner
+			.split("\n")
+			.map((line) => `> ${line}`)
+			.join("\n")}\n\n`;
+	});
+	// Anchors — `<a href="x">y</a>` → `[y](x)`. Skip empty hrefs.
+	out = out.replace(
+		/<a\b[^>]*\bhref=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi,
+		(_m, href: string, body: string) => {
+			const label = stripHtmlTags(body).trim();
+			if (!label) return "";
+			if (!href || href.startsWith("#") || hasDangerousScheme(href)) return label;
+			return `[${label}](${href})`;
+		},
+	);
+	// Images — `<img alt="x" src="y">` → `![x](y)`. Drop entirely when src missing.
+	out = out.replace(/<img\b[^>]*>/gi, (m: string) => {
+		const srcMatch = m.match(/\bsrc=["']([^"']+)["']/i);
+		if (!srcMatch) return "";
+		const src = srcMatch[1] as string;
+		const altMatch = m.match(/\balt=["']([^"']*)["']/i);
+		const alt = altMatch ? (altMatch[1] as string) : "";
+		return `![${alt}](${src})`;
+	});
+	// Lists. Convert `<li>` → `- ` then drop the surrounding `<ul>/<ol>`.
+	out = out.replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, (_m, body: string) => `\n- ${stripHtmlTags(body).trim()}`);
+	out = out.replace(/<\/?(ul|ol)\b[^>]*>/gi, "");
+	// Emphasis + strong + bold + italic.
+	out = out.replace(/<(?:strong|b)\b[^>]*>([\s\S]*?)<\/(?:strong|b)>/gi, (_m, body: string) => `**${stripHtmlTags(body)}**`);
+	out = out.replace(/<(?:em|i)\b[^>]*>([\s\S]*?)<\/(?:em|i)>/gi, (_m, body: string) => `*${stripHtmlTags(body)}*`);
+	// Line break + horizontal rule.
+	out = out.replace(/<br\s*\/?>/gi, "\n");
+	out = out.replace(/<hr\s*\/?>/gi, "\n\n---\n\n");
+	// Paragraph + div boundaries → double newline.
+	out = out.replace(/<\/p\s*>/gi, "\n\n");
+	out = out.replace(/<\/div\s*>/gi, "\n");
+	// Strip everything else.
+	out = stripHtmlTags(out);
+	// Normalize whitespace.
+	out = normalizeWhitespace(out);
+	// Strip invisible Unicode (prompt-injection defense).
+	out = stripInvisibleUnicode(out);
+	// Scrub envelope markers — a poisoned page can't pose as the boundary.
+	out = stripEnvelopeMarkers(out);
+	return out.trim();
+}
+
+/**
+ * True when an `href` resolves to a script-bearing scheme. Mirrors how an HTML
+ * parser reads a URL: leading ASCII whitespace and any embedded tab/newline are
+ * ignored before the scheme is matched, so `\tjava\nscript:` is treated as
+ * `javascript:`. Covers the schemes that can execute or smuggle markup.
+ */
+function hasDangerousScheme(href: string): boolean {
+	// Drop the ASCII control + space characters (0x00-0x20) an HTML URL parser
+	// strips/ignores before scheme detection, then match the scheme exactly.
+	const normalized = href.replace(/[\x00-\x20]/g, "").toLowerCase();
+	return /^(?:javascript|data|vbscript):/.test(normalized);
+}
+
+/**
+ * Strip ALL HTML tags from a string, leaving the visible text.
+ *
+ * A one-shot `replace` can't do this soundly. Removing an inner match lets the
+ * text on either side close up into a tag the pass has already walked past, so
+ * `<<a>script>alert(1)<</a>/script>` survives a `/<\/?[a-z][^>]*>/g` strip as a
+ * working `<script>` block. This scans left to right and repeats the scan until
+ * the string stops changing; every pass that changes anything deletes at least
+ * one character, so the loop always terminates.
+ *
+ * A `<` that isn't followed by a tag name (`a < b`, `x <- y`, `<3`) is TEXT and
+ * is kept — an HTML tokenizer reads it the same way, and dropping it would eat
+ * operators out of scraped code samples. An unterminated `<tag …` with no `>`
+ * anywhere after it takes the rest of the input with it: the page was truncated
+ * mid-tag, and emitting the fragment would let it fuse with a `>` downstream.
+ *
+ * Shared by the web-search providers (`duckduckgo`, `wikipedia`) so there's one
+ * implementation of this to get right rather than one per scraper.
+ */
+export function stripHtmlTags(html: string): string {
+	let out = html;
+	// Angle brackets nested k deep need k passes. The bound keeps hostile input
+	// from turning this quadratic; anything past it gets the blunt scrub below.
+	for (let pass = 0; pass < 16; pass += 1) {
+		const next = stripHtmlTagsOnce(out);
+		if (next === out) return out;
+		out = next;
+	}
+	// Bound exhausted — drop every remaining `<` so no tag can survive.
+	return out.replace(/</g, "");
+}
+
+/** One left-to-right tag-stripping pass. See {@link stripHtmlTags}. */
+function stripHtmlTagsOnce(html: string): string {
+	let out = "";
+	let i = 0;
+	const n = html.length;
+	while (i < n) {
+		const lt = html.indexOf("<", i);
+		if (lt === -1) return out + html.slice(i);
+		// `<` followed by anything but a name start / `!` / `?` / `/` is literal.
+		if (!/[a-z!?/]/i.test(html[lt + 1] ?? "")) {
+			out += html.slice(i, lt + 1);
+			i = lt + 1;
+			continue;
+		}
+		out += html.slice(i, lt);
+		const end = findTagEnd(html, lt);
+		if (end === -1) return out; // unterminated tag — the rest is inside it
+		i = end;
+	}
+	return out;
+}
+
+/**
+ * Index just past the `>` closing the tag that opens at `lt`, or -1 when the
+ * tag never closes. Quoted attribute values are skipped so a literal `>` inside
+ * `title="a > b"` doesn't end the tag early; when the quoting turns out to be
+ * unbalanced (malformed markup) we fall back to the first raw `>` instead of
+ * swallowing the rest of the document.
+ */
+function findTagEnd(html: string, lt: number): number {
+	const rawGt = html.indexOf(">", lt + 1);
+	if (rawGt === -1) return -1;
+	let quote = "";
+	for (let j = lt + 1; j < html.length; j += 1) {
+		const ch = html[j] as string;
+		if (quote) {
+			if (ch === quote) quote = "";
+		} else if (ch === '"' || ch === "'") {
+			quote = ch;
+		} else if (ch === ">") {
+			return j + 1;
+		}
+	}
+	return rawGt + 1;
+}
+
+/** Collapse runs of whitespace; keep paragraph breaks (double newlines). */
+function normalizeWhitespace(input: string): string {
+	return input
+		.replace(/[ \t]+/g, " ")
+		.replace(/\n{3,}/g, "\n\n")
+		.replace(/[ \t]*\n[ \t]*/g, "\n");
+}
+
+/**
+ * Cheap heuristic: scan the open/close tag stream and track depth. If at
+ * any point the depth exceeds `maxDepth`, return true. Not exact — self-
+ * closing tags, malformed HTML, and void elements are best-effort — but
+ * good enough to refuse a `<div>` × 10 000 nesting attack before linkedom
+ * blows the recursion stack.
+ */
+function exceedsEstimatedNestingDepth(html: string, maxDepth: number): boolean {
+	let depth = 0;
+	let max = 0;
+	const VOID_RE = /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i;
+	const re = /<\/?([a-z][a-z0-9-]*)\b[^>]*?(\/?)>/gi;
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(html)) !== null) {
+		const tag = m[1] ?? "";
+		const selfClosing = m[2] === "/" || VOID_RE.test(tag);
+		const isClose = m[0].startsWith("</");
+		if (isClose) {
+			if (depth > 0) depth -= 1;
+		} else if (!selfClosing) {
+			depth += 1;
+			if (depth > max) max = depth;
+			if (max > maxDepth) return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Decode the most common HTML entities. Not exhaustive — covers what
+ * actually appears in scraped pages 99% of the time.
+ */
+export function decodeHtmlEntities(input: string): string {
+	// `&amp;` is decoded LAST so an already-decoded entity is never re-expanded
+	// into a second pass (e.g. `&amp;lt;` must yield `&lt;`, not `<`).
+	return input
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&quot;/g, '"')
+		.replace(/&#039;/g, "'")
+		.replace(/&apos;/g, "'")
+		.replace(/&nbsp;/g, " ")
+		.replace(/&#x([0-9a-f]+);/gi, (_m, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+		.replace(/&#(\d+);/g, (_m, dec: string) => String.fromCodePoint(parseInt(dec, 10)))
+		.replace(/&amp;/g, "&");
+}
+
+/* ─────────────────────────── extractors ─────────────────────────── */
+
+export interface ExtractedContent {
+	title?: string;
+	text: string;
+	extractor: "readability" | "basic-html" | "raw-html" | "json" | "raw" | "cf-markdown";
+}
+
+/**
+ * Run Mozilla Readability on an HTML doc. Returns null when Readability
+ * gave us nothing useful (rare — Readability is forgiving). Caller should
+ * fall back to `extractBasicHtmlContent` on null.
+ */
+export async function extractReadableContent(
+	html: string,
+	baseUrl: string,
+): Promise<ExtractedContent | null> {
+	// Sanitize first — Readability would otherwise score hidden-style spam
+	// as real content.
+	const sanitized = sanitizeHtml(html);
+	// Pre-flight: very-deep DOMs blow Readability's recursion stack.
+	if (sanitized.length > 1_048_576) return null;
+	// Nesting-depth guard — pathologically nested `<div><div>…` would
+	// also crash the parser. Bail fast if the open-tag streak suggests
+	// excessive depth.
+	if (exceedsEstimatedNestingDepth(sanitized, 3_000)) return null;
+	let parseHTML: LinkedomModule["parseHTML"];
+	let Readability: ReadabilityModule["Readability"];
+	try {
+		const linkedom = await loadLinkedom();
+		parseHTML = linkedom.parseHTML;
+		const readability = await loadReadability();
+		Readability = readability.Readability;
+	} catch {
+		// Lazy load failed — fall through; caller uses basic-html fallback.
+		return null;
+	}
+	let doc: DocumentLike;
+	try {
+		const result = parseHTML(sanitized);
+		doc = result.document;
+		// Set baseURI so relative <a href> targets resolve correctly.
+		try {
+			Object.defineProperty(doc, "baseURI", { value: baseUrl, configurable: true });
+		} catch {
+			/* base-uri may be read-only in some linkedom versions */
+		}
+	} catch {
+		return null;
+	}
+	const parsed = (() => {
+		try {
+			// charThreshold:0 — accept short articles (FAQs, landing pages,
+			// docs). Default 500 would drop them to the regex fallback for no
+			// benefit. classesToPreserve empty + keepClasses:false → keep
+			// markup clean.
+			return new Readability(doc, { charThreshold: 0, classesToPreserve: [], keepClasses: false }).parse();
+		} catch {
+			return null;
+		}
+	})();
+	if (!parsed?.content) return null;
+	const markdown = htmlToMarkdown(parsed.content);
+	if (!markdown.trim()) return null;
+	const rawTitle = parsed.title?.trim();
+	const title = rawTitle ? stripEnvelopeMarkers(stripInvisibleUnicode(rawTitle)) : undefined;
+	return {
+		title: title || undefined,
+		text: markdown,
+		extractor: "readability",
+	};
+}
+
+/**
+ * Pure-regex fallback when Readability returns nothing. Strips all HTML and
+ * returns the visible text. Loses structure (no headings, no lists), but
+ * better than returning nothing — for small/SPA pages this is what the
+ * model gets.
+ */
+export function extractBasicHtmlContent(html: string): ExtractedContent {
+	const sanitized = sanitizeHtml(html);
+	const titleMatch = sanitized.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
+	const rawTitle = titleMatch
+		? decodeHtmlEntities(stripHtmlTags(titleMatch[1] as string)).trim()
+		: undefined;
+	const title = rawTitle ? stripEnvelopeMarkers(stripInvisibleUnicode(rawTitle)) : undefined;
+	const text = stripEnvelopeMarkers(
+		stripInvisibleUnicode(normalizeWhitespace(decodeHtmlEntities(stripHtmlTags(sanitized)))),
+	).trim();
+	return { title: title || undefined, text, extractor: "basic-html" };
+}
+
+/** Strip markdown back to plain text (for the `extractMode: "text"` path). */
+export function markdownToText(md: string): string {
+	let out = md;
+	// Fenced code blocks → keep body, drop fences.
+	out = out.replace(/```[\s\S]*?```/g, (m: string) => m.replace(/^```.*\n?/, "").replace(/```$/, ""));
+	// Inline code → keep body.
+	out = out.replace(/`([^`]+)`/g, "$1");
+	// Links → keep label.
+	out = out.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
+	// Images → keep alt.
+	out = out.replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1");
+	// Headings, blockquotes, list markers.
+	out = out.replace(/^#{1,6}\s+/gm, "").replace(/^>\s?/gm, "").replace(/^\s*[-*]\s+/gm, "");
+	// Emphasis.
+	out = out.replace(/\*\*([^*]+)\*\*/g, "$1").replace(/\*([^*]+)\*/g, "$1");
+	// Horizontal rules.
+	out = out.replace(/^---+\s*$/gm, "");
+	return normalizeWhitespace(out).trim();
+}
+
+/** Format text+title into a `truncateText`-able body. */
+export function composeFetchBody(extracted: ExtractedContent, opts: { extractMode: "markdown" | "text"; maxChars: number }): {
+	text: string;
+	truncated: boolean;
+} {
+	const body = opts.extractMode === "text" ? markdownToText(extracted.text) : extracted.text;
+	const withTitle = extracted.title ? `# ${extracted.title}\n\n${body}` : body;
+	return truncateText(withTitle, opts.maxChars);
+}
